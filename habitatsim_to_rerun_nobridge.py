@@ -51,10 +51,26 @@ MAP_FRAME = "map"
 BASE_FRAME = "spot/body"
 DEFAULT_ODOM_TOPIC = "/spot/platform/odom"
 
-# Manual tweak (meters) to line up occupancy map with robot/pointclouds
-# Start with these, then tune.
+# Manual spatial offset applied to the occupancy grid (in MAP_FRAME, meters).
+#
+# Why this is needed:
+# The mapping system that publishes the OccupancyGrid uses a shifted origin:
+#     Occ/mapOriginX = -30.0
+#     Occ/mapOriginY = -30.0
+# meaning the (0,0) cell is located 30 meters away from the map frame origin
+# (i.e., the map is defined as a 60m x 60m area centered around (0,0)).
+#
+# Our robot pointclouds and camera poses, however, are centered near (0,0)
+# in the map frame and do NOT apply this -30m origin shift.
+#
+# To visually align the occupancy grid with the robot and pointclouds in Rerun,
+# we add back HALF of that map-origin shift (+15m, +15m). This brings the
+# occupancy map's "visual center" into the same coordinate space as the robot.
+#
+# If your map size or origin changes, adjust these values accordingly.
 OCC_OFFSET_X = 15.0
 OCC_OFFSET_Y = 15.0
+
 
 
 # -----------------------------------------------------------------------------
