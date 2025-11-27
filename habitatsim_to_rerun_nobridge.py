@@ -10,16 +10,17 @@ Logs 5 low-res cameras in a "camera_lowres" layout with proper 3D pose:
     world/<cam>_camera_lowres/detection
 
 Camera poses are computed like DepthInterface.cpp:
-  - TF:   "None/body" -> depth frame
-  - Odom: /None/platform/odom
+  - TF:   "spot/body" -> depth frame
+  - Odom: /spot/platform/odom
   - Compose to get camera pose in world/map.
 
-Also logs IMU, odometry, TF, and point clouds.
+Also logs IMU, odometry, TF, point clouds, and an occupancy grid.
 
 Load-control flags (set here in Python):
   - LOG_DEPTH_IMAGES: whether to log depth images
   - LOG_TERRAIN_MAP: whether to subscribe/log /terrain_map_ext
   - LOG_COLORED_REGISTERED_SCAN: whether to subscribe/log /colored_registered_scan
+  - LOG_OCCUPANCY_GRID: whether to subscribe/log /occupancy_grid
 
 Downsampling / throttling (set here in Python):
   - TERRAIN_DOWNSAMPLE_STRIDE: keep every N-th point from terrain map
@@ -41,7 +42,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from tf2_msgs.msg import TFMessage
 
 import rerun as rr
@@ -58,6 +59,7 @@ except ImportError:
 LOG_DEPTH_IMAGES = False               # log per-camera depth images
 LOG_TERRAIN_MAP = True                 # subscribe/log /terrain_map_ext
 LOG_COLORED_REGISTERED_SCAN = True     # subscribe/log /colored_registered_scan
+LOG_OCCUPANCY_GRID = True              # subscribe/log /occupancy_grid
 
 # Downsampling (stride >= 1; 1 = no downsampling)
 TERRAIN_DOWNSAMPLE_STRIDE = 4          # keep every N-th point from terrain
@@ -72,8 +74,8 @@ TERRAIN_LOG_EVERY_N = 2
 COLORED_LOG_EVERY_N = 2
 # ----------------------------------------------------------------------
 
-BASE_FRAME = "None/body"
-DEFAULT_ODOM_TOPIC = "/None/platform/odom"
+BASE_FRAME = "spot/body"
+DEFAULT_ODOM_TOPIC = "/spot/platform/odom"
 
 
 # -----------------------------------------------------------------------------
@@ -315,7 +317,15 @@ def try_connect_grpc(logger, host: str, port: int, timeout_s: float = 5.0):
     raise RuntimeError(f"Could not connect to Rerun gRPC at {host}:{port}: {last_exc}")
 
 
-def pointcloud2_to_xyz_and_color(logger, msg: PointCloud2):
+def pointcloud2_to_xyz_and_color_downsampled(logger, msg: PointCloud2, stride: int = 1, max_points=None):
+    """
+    Convert PointCloud2 into downsampled:
+      positions: (N, 3) float32
+      colors:    (N, 3) uint8 or None
+
+    stride: keep every stride-th input point
+    max_points: stop after this many kept points (None = no cap)
+    """
     if pc2 is None:
         logger.warn("sensor_msgs_py.point_cloud2 not available; cannot decode PointCloud2")
         return np.zeros((0, 3), np.float32), None
@@ -330,18 +340,27 @@ def pointcloud2_to_xyz_and_color(logger, msg: PointCloud2):
         positions = []
         colors = []
 
-        for p in pc2.read_points(msg, skip_nans=False, field_names=field_names):
+        kept = 0
+        for i, p in enumerate(pc2.read_points(msg, skip_nans=False, field_names=field_names)):
+            if stride > 1 and (i % stride) != 0:
+                continue
+
             p_dict = dict(zip(field_names, p))
+
+            # --- POSITION ---
             try:
                 x = float(p_dict.get("x", 0.0))
                 y = float(p_dict.get("y", 0.0))
                 z = float(p_dict.get("z", 0.0))
             except Exception:
                 continue
+
             if np.isnan(x) or np.isnan(y) or np.isnan(z):
                 continue
+
             positions.append((x, y, z))
 
+            # --- COLOR (optional) ---
             color_tuple = None
             try:
                 if has_rgb_packed:
@@ -381,9 +400,12 @@ def pointcloud2_to_xyz_and_color(logger, msg: PointCloud2):
 
             if color_tuple is not None:
                 colors.append(color_tuple)
-            else:
-                if has_rgb_packed or has_rgb_separate or has_intensity:
-                    colors.append((0, 0, 0))
+            elif has_rgb_packed or has_rgb_separate or has_intensity:
+                colors.append((0, 0, 0))
+
+            kept += 1
+            if max_points is not None and kept >= max_points:
+                break
 
         positions = np.asarray(positions, dtype=np.float32)
         if colors:
@@ -392,10 +414,11 @@ def pointcloud2_to_xyz_and_color(logger, msg: PointCloud2):
             colors_arr = np.asarray(colors, dtype=np.uint8)
         else:
             colors_arr = None
+
         return positions, colors_arr
 
     except Exception as e:
-        logger.warn(f"Failed to convert PointCloud2: {e}")
+        logger.warn(f"Failed to convert PointCloud2 (downsampled): {e}")
         return np.zeros((0, 3), np.float32), None
 
 
@@ -525,6 +548,7 @@ class HabitatToRerun(Node):
             f"LOG_DEPTH_IMAGES={LOG_DEPTH_IMAGES}, "
             f"LOG_TERRAIN_MAP={LOG_TERRAIN_MAP}, "
             f"LOG_COLORED_REGISTERED_SCAN={LOG_COLORED_REGISTERED_SCAN}, "
+            f"LOG_OCCUPANCY_GRID={LOG_OCCUPANCY_GRID}, "
             f"TERRAIN_DOWNSAMPLE_STRIDE={TERRAIN_DOWNSAMPLE_STRIDE}, "
             f"COLORED_DOWNSAMPLE_STRIDE={COLORED_DOWNSAMPLE_STRIDE}, "
             f"TERRAIN_MAX_POINTS={TERRAIN_MAX_POINTS}, "
@@ -565,28 +589,28 @@ class HabitatToRerun(Node):
         # 5 cameras: paths under "world/..."
         self.camera_configs = {
             "frontleft": {
-                "rgb_topic": "/None/camera/frontleft/image/compressed",
-                "depth_topic": "/None/depth/frontleft/image",
+                "rgb_topic": "/spot/camera/frontleft/image/compressed",
+                "depth_topic": "/spot/depth/frontleft/image",
                 "detection_topic": "/proc_image/detection/image/frontleft",
             },
             "frontright": {
-                "rgb_topic": "/None/camera/frontright/image/compressed",
-                "depth_topic": "/None/depth/frontright/image",
+                "rgb_topic": "/spot/camera/frontright/image/compressed",
+                "depth_topic": "/spot/depth/frontright/image",
                 "detection_topic": "/proc_image/detection/image/frontright",
             },
             "left": {
-                "rgb_topic": "/None/camera/left/image/compressed",
-                "depth_topic": "/None/depth/left/image",
+                "rgb_topic": "/spot/camera/left/image/compressed",
+                "depth_topic": "/spot/depth/left/image",
                 "detection_topic": "/proc_image/detection/image/left",
             },
             "right": {
-                "rgb_topic": "/None/camera/right/image/compressed",
-                "depth_topic": "/None/depth/right/image",
+                "rgb_topic": "/spot/camera/right/image/compressed",
+                "depth_topic": "/spot/depth/right/image",
                 "detection_topic": "/proc_image/detection/image/right",
             },
             "back": {
-                "rgb_topic": "/None/camera/back/image/compressed",
-                "depth_topic": "/None/depth/back/image",
+                "rgb_topic": "/spot/camera/back/image/compressed",
+                "depth_topic": "/spot/depth/back/image",
                 "detection_topic": "/proc_image/detection/image/back",
             },
         }
@@ -619,7 +643,7 @@ class HabitatToRerun(Node):
                 f"Subscribed depth for {cam_name}: {depth_topic} -> {base_entity}/depth"
             )
 
-            # Detection overlay (sensor_msgs/Image, BGR in ROS, converted to RGB for Rerun)
+            # Detection overlay
             self.create_subscription(
                 Image,
                 detection_topic,
@@ -658,6 +682,18 @@ class HabitatToRerun(Node):
             )
         else:
             self.get_logger().info("Skipping subscription to /colored_registered_scan (LOG_COLORED_REGISTERED_SCAN=False)")
+
+        # Occupancy grid
+        if LOG_OCCUPANCY_GRID:
+            self.create_subscription(
+                OccupancyGrid,
+                "/occupancy_grid",
+                self.cb_occupancy_grid,
+                qos_best_effort(1),
+            )
+            self.get_logger().info(
+                "Subscribed to occupancy grid: /occupancy_grid -> world/occupancy_grid"
+            )
 
         # IMU / Odom / TF
         self.create_subscription(Imu, "/habitatsim/imu/data", self.cb_imu, 50)
@@ -731,20 +767,9 @@ class HabitatToRerun(Node):
             )
 
     def cb_rgb_camera_lowres(self, msg: CompressedImage, base_entity: str):
-        """
-        Log low-res RGB image at <base_entity>/bgr.
-
-        If we know the matching depth resolution for this camera, and cv2 is
-        available, we:
-          - decode the JPEG/PNG
-          - resize to the depth resolution
-          - re-encode and log
-        so that the RGB texture visually matches the depth/camera frustum size.
-        """
         entity_path = f"{base_entity}/bgr"
         raw_data = bytes(msg.data)
 
-        # Determine mime from magic bytes / format
         if raw_data.startswith(b"\xff\xd8\xff"):
             mime = "image/jpeg"
         elif raw_data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -763,7 +788,6 @@ class HabitatToRerun(Node):
                     f"{entity_path}: unknown compressed image format; assuming jpeg"
                 )
 
-        # If we don't know the depth resolution yet or have no cv2, just log original
         target_res = self.camera_depth_res.get(base_entity, None)
         if target_res is None or self._cv2 is None:
             ok = send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
@@ -833,7 +857,7 @@ class HabitatToRerun(Node):
         entity_path = f"{base_entity}/detection"
 
         try:
-            img_rgb = color_image_from_ros(msg)  # this returns RGB
+            img_rgb = color_image_from_ros(msg)  # returns RGB
         except Exception as e:
             self.get_logger().warn(
                 f"{entity_path}: detection image convert failed: {e}\n{traceback.format_exc()}"
@@ -844,7 +868,6 @@ class HabitatToRerun(Node):
         if target_res is not None and self._cv2 is not None:
             target_w, target_h = target_res
             try:
-                # OpenCV treats this as "BGR", but we're only resizing, so channel order doesn't matter.
                 resized = self._cv2.resize(
                     img_rgb,
                     (target_w, target_h),
@@ -950,23 +973,16 @@ class HabitatToRerun(Node):
                 f"Failed to log camera pose at {base_entity}: {e}"
             )
 
-    # --- Pointcloud / IMU / odom / TF ---------------------------------
+    # --- Pointcloud / IMU / occupancy / odom / TF ----------------------
 
     def cb_pointcloud(self, msg: PointCloud2, entity_path: str):
         """
         Handle both terrain and colored point clouds with:
-          - configurable downsampling,
-          - per-stream frame throttling (log every N-th frame),
-          - max point caps per frame.
+          - pre-decode frame throttling (LOG_EVERY_N),
+          - decode-time downsampling (stride),
+          - decode-time max point cap.
         """
-        pts, colors = pointcloud2_to_xyz_and_color(self.get_logger(), msg)
-
         # Decide which config to use based on entity_path
-        stride = 1
-        max_points = None
-        every_n = 1
-        counter_attr = None
-
         if entity_path.endswith("terrain_map_ext"):
             stride = max(1, int(TERRAIN_DOWNSAMPLE_STRIDE))
             max_points = TERRAIN_MAX_POINTS if TERRAIN_MAX_POINTS and TERRAIN_MAX_POINTS > 0 else None
@@ -978,31 +994,74 @@ class HabitatToRerun(Node):
             every_n = max(1, int(COLORED_LOG_EVERY_N))
             counter_attr = "_colored_pc_count"
         else:
-            # Unknown pointcloud path: no special throttling/downsampling
+            # Unknown pointcloud path: decode with no throttling/downsampling
+            pts, colors = pointcloud2_to_xyz_and_color_downsampled(self.get_logger(), msg, stride=1, max_points=None)
             send_point_cloud(self.get_logger(), entity_path, pts, colors)
             return
 
-        # Per-stream frame throttling: log only every_n-th message
+        # 1) frame throttling BEFORE decoding
         if counter_attr is not None:
             count = getattr(self, counter_attr, 0) + 1
             setattr(self, counter_attr, count)
             if count % every_n != 0:
-                # Skip this frame entirely
                 return
 
-        # Downsample points by stride
-        if stride > 1 and pts.size > 0:
-            pts = pts[::stride]
-            if colors is not None:
-                colors = colors[::stride]
+        # 2) decode with stride + max_points baked in
+        pts, colors = pointcloud2_to_xyz_and_color_downsampled(
+            self.get_logger(), msg, stride=stride, max_points=max_points
+        )
 
-        # Hard cap on max_points
-        if max_points is not None and max_points > 0 and pts.shape[0] > max_points:
-            pts = pts[:max_points]
-            if colors is not None and colors.shape[0] > max_points:
-                colors = colors[:max_points]
+        self.get_logger().info(
+            f"{entity_path}: logging {pts.shape[0]} points (stride={stride}, max_points={max_points}, every_n={every_n})"
+        )
 
         send_point_cloud(self.get_logger(), entity_path, pts, colors)
+
+    def cb_occupancy_grid(self, msg: OccupancyGrid):
+        """
+        Visualize OccupancyGrid as an image with a transform, under:
+
+          world/occupancy_grid          (Transform3D origin pose)
+          world/occupancy_grid/image    (rr.Image RGB)
+        """
+        if msg.info.width == 0 or msg.info.height == 0:
+            return
+
+        w = msg.info.width
+        h = msg.info.height
+
+        # data is row-major, int8 [-1, 0..100]
+        data = np.array(msg.data, dtype=np.int16).reshape((h, w))
+
+        # Map: unknown -> 128, free (0) -> 0, occupied (>0) -> 255
+        img = np.zeros((h, w), dtype=np.uint8)
+        img[data < 0] = 128      # unknown
+        img[data == 0] = 0       # free
+        img[data > 0] = 255      # occupied (you can tune this mapping)
+
+        # Make RGB for Rerun
+        rgb = np.stack([img, img, img], axis=-1)
+
+        # Log origin pose as Transform3D
+        origin = msg.info.origin
+        p = origin.position
+        q = origin.orientation
+        try:
+            rr.log(
+                "world/occupancy_grid",
+                rr.Transform3D(
+                    translation=[p.x, p.y, p.z],
+                    quaternion=[q.x, q.y, q.z, q.w],
+                ),
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log occupancy_grid transform: {e}")
+
+        # Log image
+        try:
+            rr.log("world/occupancy_grid/image", rr.Image(rgb))
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log occupancy_grid image: {e}")
 
     def cb_imu(self, msg: Imu):
         try:

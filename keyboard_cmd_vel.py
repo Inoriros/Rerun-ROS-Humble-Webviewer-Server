@@ -26,7 +26,7 @@ STOP_TIMEOUT = 0.2  # auto stop timeout
 
 
 HELP = """
-Keyboard teleop → /None/cmd_vel (geometry_msgs/msg/Twist)
+Keyboard teleop → /spot/cmd_vel (geometry_msgs/msg/Twist)
 
 Controls:
     w : forward   (+x)
@@ -87,7 +87,7 @@ def restart_path_follower():
 class KeyboardCmdVel(Node):
     def __init__(self, move_scale, rotate_scale):
         super().__init__("keyboard_cmd_vel")
-        self.pub = self.create_publisher(Twist, "/None/cmd_vel", 10)
+        self.pub = self.create_publisher(Twist, "/spot/cmd_vel", 10)
 
         self.move_scale = move_scale
         self.rotate_scale = rotate_scale

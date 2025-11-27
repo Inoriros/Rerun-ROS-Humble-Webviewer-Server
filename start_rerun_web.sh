@@ -24,7 +24,7 @@ tmux send-keys -t $SESSION_NAME:1 "$PYTHON_CMD" C-m
 # --- Window 2: Keyboard cmd_vel Controller ---
 tmux new-window -t $SESSION_NAME -n teleop
 # TELEOP_CMD="export ROS_DOMAIN_ID=88 && python3 keyboard_cmd_vel.py --move-scale 1.0 --rotate-scale 1.0"
-TELEOP_CMD="python3 keyboard_cmd_vel.py --move-scale 1.0 --rotate-scale 1.0"
+TELEOP_CMD="python3 keyboard_cmd_vel.py --move-scale 0.8 --rotate-scale 0.6"
 tmux send-keys -t $SESSION_NAME:2 "$TELEOP_CMD" C-m
 
 
