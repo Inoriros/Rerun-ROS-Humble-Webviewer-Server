@@ -2,33 +2,8 @@
 """
 habitatsim_to_rerun_nobridge.py
 
-Logs 5 low-res cameras in a "camera_lowres" layout with proper 3D pose:
-
-  world/<cam>_camera_lowres
-    world/<cam>_camera_lowres/bgr
-    world/<cam>_camera_lowres/depth
-    world/<cam>_camera_lowres/detection
-
-Camera poses are computed like DepthInterface.cpp:
-  - TF:   "spot/body" -> depth frame
-  - Odom: /spot/platform/odom
-  - Compose to get camera pose in world/map.
-
-Also logs IMU, odometry, TF, point clouds, and an occupancy grid.
-
-Load-control flags (set here in Python):
-  - LOG_DEPTH_IMAGES: whether to log depth images
-  - LOG_TERRAIN_MAP: whether to subscribe/log /terrain_map_ext
-  - LOG_COLORED_REGISTERED_SCAN: whether to subscribe/log /colored_registered_scan
-  - LOG_OCCUPANCY_GRID: whether to subscribe/log /occupancy_grid
-
-Downsampling / throttling (set here in Python):
-  - TERRAIN_DOWNSAMPLE_STRIDE: keep every N-th point from terrain map
-  - COLORED_DOWNSAMPLE_STRIDE: keep every N-th point from colored cloud
-  - TERRAIN_MAX_POINTS: cap terrain points per frame (0/None = no cap)
-  - COLORED_MAX_POINTS: cap colored points per frame (0/None = no cap)
-  - TERRAIN_LOG_EVERY_N: log only every N-th terrain frame (1 = every frame)
-  - COLORED_LOG_EVERY_N: log only every N-th colored frame (1 = every frame)
+All 3D poses (cameras, base, occupancy map points, point clouds) are in the
+ROS 'map' frame (MAP_FRAME), so everything aligns with the occupancy grid.
 """
 
 import sys
@@ -54,28 +29,32 @@ except ImportError:
     pc2 = None
 
 # ----------------------------------------------------------------------
-# Simple Python flags you can flip:
+# Flags
 # ----------------------------------------------------------------------
-LOG_DEPTH_IMAGES = False               # log per-camera depth images
-LOG_TERRAIN_MAP = True                 # subscribe/log /terrain_map_ext
-LOG_COLORED_REGISTERED_SCAN = True     # subscribe/log /colored_registered_scan
-LOG_OCCUPANCY_GRID = True              # subscribe/log /occupancy_grid
+LOG_DEPTH_IMAGES = False
+LOG_TERRAIN_MAP = False
+LOG_COLORED_REGISTERED_SCAN = False
+LOG_OCCUPANCY_GRID = True
+LOG_OCCUPANCY_ONCE = False  # if map is static, can log once
 
-# Downsampling (stride >= 1; 1 = no downsampling)
-TERRAIN_DOWNSAMPLE_STRIDE = 4          # keep every N-th point from terrain
-COLORED_DOWNSAMPLE_STRIDE = 4          # keep every N-th point from colored cloud
+TERRAIN_DOWNSAMPLE_STRIDE = 4
+COLORED_DOWNSAMPLE_STRIDE = 4
 
-# Hard caps on number of points per frame (None or 0 = no cap)
 TERRAIN_MAX_POINTS = 20000
 COLORED_MAX_POINTS = 20000
 
-# Log only every N-th pointcloud message (per stream). 1 = log every frame.
 TERRAIN_LOG_EVERY_N = 2
 COLORED_LOG_EVERY_N = 2
-# ----------------------------------------------------------------------
 
+# Frames
+MAP_FRAME = "map"
 BASE_FRAME = "spot/body"
 DEFAULT_ODOM_TOPIC = "/spot/platform/odom"
+
+# Manual tweak (meters) to line up occupancy map with robot/pointclouds
+# Start with these, then tune.
+OCC_OFFSET_X = 15.0
+OCC_OFFSET_Y = 15.0
 
 
 # -----------------------------------------------------------------------------
@@ -108,18 +87,15 @@ def depth_array_from_ros(msg: Image) -> np.ndarray:
         arr = np.frombuffer(buf, dtype=np.uint16, count=h * w).reshape((h, w))
         if getattr(msg, "is_bigendian", 0) == 1:
             arr = arr.byteswap().newbyteorder()
-        # convert to meters
         return arr.astype(np.float32) / 1000.0
 
     elif enc.startswith("32F"):
         arr = np.frombuffer(buf, dtype=np.float32, count=h * w).reshape((h, w))
         if getattr(msg, "is_bigendian", 0) == 1:
             arr = arr.byteswap().newbyteorder()
-        # already meters
         return arr
 
     else:
-        # best-effort float32
         arr = np.frombuffer(buf, dtype=np.float32, count=h * w).reshape((h, w))
         if getattr(msg, "is_bigendian", 0) == 1:
             arr = arr.byteswap().newbyteorder()
@@ -127,34 +103,24 @@ def depth_array_from_ros(msg: Image) -> np.ndarray:
 
 
 def color_image_from_ros(msg: Image) -> np.ndarray:
-    """
-    Convert a sensor_msgs/Image to an RGB uint8 numpy array (H, W, 3).
-
-    The detector publishes 'bgr8', but Rerun expects RGB. This function
-    normalizes everything to RGB so colors look correct in the viewer.
-    """
     enc = (msg.encoding or "").lower()
     h, w = msg.height, msg.width
     buf = msg.data
 
     if enc in ("bgr8", "8uc3"):
-        # BGR -> RGB
         bgr = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 3))
         return bgr[..., ::-1]
     elif enc == "rgb8":
-        rgb = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 3))
-        return rgb
+        return np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 3))
     elif enc == "bgra8":
         bgra = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
         bgr = bgra[..., :3]
-        return bgr[..., ::-1]  # BGR -> RGB
+        return bgr[..., ::-1]
     elif enc == "rgba8":
         rgba = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
-        rgb = rgba[..., :3]  # RGB already
-        return rgb
+        return rgba[..., :3]
     elif enc in ("mono8", "8uc1"):
         gray = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 1))
-        # replicate to 3 channels, same value in R/G/B
         return np.repeat(gray, 3, axis=2)
     else:
         raise RuntimeError(f"Unsupported detection image encoding: '{msg.encoding}'")
@@ -204,7 +170,6 @@ def try_construct_and_log(logger, entity_path: str, candidates, positional_value
             except Exception as e:
                 tried.append(f"{name} error: {e}\n{traceback.format_exc()}")
 
-            # fallback positional-only attempt
             try:
                 instance = obj(*positional_values)
                 rr.log(entity_path, instance)
@@ -256,7 +221,6 @@ def send_encoded_image(logger, entity_path, blob: bytes, mime: str):
 
 
 def send_depth_image(logger, entity_path, depth_m: np.ndarray):
-    """Depth array is in meters. meter=1.0 means values are already meters."""
     try:
         rr.log(entity_path, rr.DepthImage(depth_m, meter=1.0))
         return True
@@ -318,14 +282,6 @@ def try_connect_grpc(logger, host: str, port: int, timeout_s: float = 5.0):
 
 
 def pointcloud2_to_xyz_and_color_downsampled(logger, msg: PointCloud2, stride: int = 1, max_points=None):
-    """
-    Convert PointCloud2 into downsampled:
-      positions: (N, 3) float32
-      colors:    (N, 3) uint8 or None
-
-    stride: keep every stride-th input point
-    max_points: stop after this many kept points (None = no cap)
-    """
     if pc2 is None:
         logger.warn("sensor_msgs_py.point_cloud2 not available; cannot decode PointCloud2")
         return np.zeros((0, 3), np.float32), None
@@ -347,7 +303,6 @@ def pointcloud2_to_xyz_and_color_downsampled(logger, msg: PointCloud2, stride: i
 
             p_dict = dict(zip(field_names, p))
 
-            # --- POSITION ---
             try:
                 x = float(p_dict.get("x", 0.0))
                 y = float(p_dict.get("y", 0.0))
@@ -360,7 +315,6 @@ def pointcloud2_to_xyz_and_color_downsampled(logger, msg: PointCloud2, stride: i
 
             positions.append((x, y, z))
 
-            # --- COLOR (optional) ---
             color_tuple = None
             try:
                 if has_rgb_packed:
@@ -434,9 +388,6 @@ def send_point_cloud(logger, entity_path: str, pts: np.ndarray, colors):
         logger.warn(f"Failed to log point cloud for {entity_path}: {e}")
 
 
-# --- small SE(3) helpers ----------------------------------------------------
-
-
 def quat_to_matrix(x, y, z, w):
     n = x * x + y * y + z * z + w * w
     if n < 1e-8:
@@ -503,24 +454,18 @@ def matrix_to_transform(T):
     return t, q
 
 
-# -----------------------------------------------------------------------------
-
-
 class HabitatToRerun(Node):
     def __init__(self):
         super().__init__("habitatsim_to_rerun")
 
-        # Rerun connection params
         self.declare_parameter("rerun_addr", "127.0.0.1")
         self.declare_parameter("rerun_port", 9876)
         host = self.get_parameter("rerun_addr").get_parameter_value().string_value
         port = int(self.get_parameter("rerun_port").get_parameter_value().integer_value)
 
-        # Odom topic
         self.declare_parameter("odometryTopic", DEFAULT_ODOM_TOPIC)
         self.odom_topic = self.get_parameter("odometryTopic").get_parameter_value().string_value
 
-        # Depth intrinsics (same as DepthInterface C++)
         self.declare_parameter("fx", 128.0)
         self.declare_parameter("fy", 128.0)
         self.declare_parameter("cx", 128.0)
@@ -531,7 +476,6 @@ class HabitatToRerun(Node):
         self.cx = float(self.get_parameter("cx").get_parameter_value().double_value)
         self.cy = float(self.get_parameter("cy").get_parameter_value().double_value)
 
-        # RGB intrinsics (if you ever need them later)
         self.declare_parameter("rgb_fx", 360.0)
         self.declare_parameter("rgb_fy", 360.0)
         self.declare_parameter("rgb_cx", 360.0)
@@ -544,74 +488,59 @@ class HabitatToRerun(Node):
         rr.init("habitatsim_rerun")
         ep = try_connect_grpc(self.get_logger(), host, port)
         self.get_logger().info(f"Rerun connected via {ep}")
-        self.get_logger().info(
-            f"LOG_DEPTH_IMAGES={LOG_DEPTH_IMAGES}, "
-            f"LOG_TERRAIN_MAP={LOG_TERRAIN_MAP}, "
-            f"LOG_COLORED_REGISTERED_SCAN={LOG_COLORED_REGISTERED_SCAN}, "
-            f"LOG_OCCUPANCY_GRID={LOG_OCCUPANCY_GRID}, "
-            f"TERRAIN_DOWNSAMPLE_STRIDE={TERRAIN_DOWNSAMPLE_STRIDE}, "
-            f"COLORED_DOWNSAMPLE_STRIDE={COLORED_DOWNSAMPLE_STRIDE}, "
-            f"TERRAIN_MAX_POINTS={TERRAIN_MAX_POINTS}, "
-            f"COLORED_MAX_POINTS={COLORED_MAX_POINTS}, "
-            f"TERRAIN_LOG_EVERY_N={TERRAIN_LOG_EVERY_N}, "
-            f"COLORED_LOG_EVERY_N={COLORED_LOG_EVERY_N}"
-        )
 
-        # TF & odom
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.current_odom = None
         self.has_odom = False
 
-        # Track which cameras already have a Pinhole logged
+        self._occupancy_logged_once = False
         self.pinhole_logged = set()
+        self.camera_depth_res = {}
 
-        # Track per-camera depth resolution (so we can resize RGB/detections to match)
-        self.camera_depth_res = {}  # base_entity -> (width, height)
-
-        # Optional OpenCV for RGB/detection resizing
         try:
             import cv2  # type: ignore
             self._cv2 = cv2
             self.get_logger().info("OpenCV (cv2) found; will resize RGB/detection to depth resolution.")
         except ImportError:
             self._cv2 = None
-            self.get_logger().warn(
-                "OpenCV (cv2) not available; RGB/detection will NOT be resized to depth resolution."
-            )
+            self.get_logger().warn("OpenCV (cv2) not available; no resizing of RGB/detection.")
 
-        # Counters for per-stream throttling of point clouds
         self._terrain_pc_count = 0
         self._colored_pc_count = 0
 
         img_qos = qos_best_effort(10)
 
-        # 5 cameras: paths under "world/..."
         self.camera_configs = {
             "frontleft": {
                 "rgb_topic": "/spot/camera/frontleft/image/compressed",
                 "depth_topic": "/spot/depth/frontleft/image",
                 "detection_topic": "/proc_image/detection/image/frontleft",
+                "frame": "head_left_rgbd_optical",
             },
             "frontright": {
                 "rgb_topic": "/spot/camera/frontright/image/compressed",
                 "depth_topic": "/spot/depth/frontright/image",
                 "detection_topic": "/proc_image/detection/image/frontright",
+                "frame": "head_right_rgbd_optical",
             },
             "left": {
                 "rgb_topic": "/spot/camera/left/image/compressed",
                 "depth_topic": "/spot/depth/left/image",
                 "detection_topic": "/proc_image/detection/image/left",
+                "frame": "left_rgbd_optical",
             },
             "right": {
                 "rgb_topic": "/spot/camera/right/image/compressed",
                 "depth_topic": "/spot/depth/right/image",
                 "detection_topic": "/proc_image/detection/image/right",
+                "frame": "right_rgbd_optical",
             },
             "back": {
                 "rgb_topic": "/spot/camera/back/image/compressed",
                 "depth_topic": "/spot/depth/back/image",
                 "detection_topic": "/proc_image/detection/image/back",
+                "frame": "rear_rgbd_optical",
             },
         }
 
@@ -621,40 +550,27 @@ class HabitatToRerun(Node):
             depth_topic = cfg["depth_topic"]
             detection_topic = cfg["detection_topic"]
 
-            # RGB (compressed)
             self.create_subscription(
                 CompressedImage,
                 rgb_topic,
                 lambda msg, base=base_entity: self.cb_rgb_camera_lowres(msg, base),
                 img_qos,
             )
-            self.get_logger().info(
-                f"Subscribed RGB for {cam_name}: {rgb_topic} -> {base_entity}/bgr"
-            )
 
-            # Depth
             self.create_subscription(
                 Image,
                 depth_topic,
-                lambda msg, base=base_entity: self.cb_depth_camera_lowres(msg, base),
+                lambda msg, base=base_entity, cam=cam_name: self.cb_depth_camera_lowres(msg, base, cam),
                 img_qos,
             )
-            self.get_logger().info(
-                f"Subscribed depth for {cam_name}: {depth_topic} -> {base_entity}/depth"
-            )
 
-            # Detection overlay
             self.create_subscription(
                 Image,
                 detection_topic,
                 lambda msg, base=base_entity: self.cb_detection_image(msg, base),
                 img_qos,
             )
-            self.get_logger().info(
-                f"Subscribed detection for {cam_name}: {detection_topic} -> {base_entity}/detection"
-            )
 
-        # Point clouds
         pc_qos = qos_best_effort(10)
 
         if LOG_TERRAIN_MAP:
@@ -664,11 +580,6 @@ class HabitatToRerun(Node):
                 lambda msg: self.cb_pointcloud(msg, "world/pointcloud/terrain_map_ext"),
                 pc_qos,
             )
-            self.get_logger().info(
-                "Subscribed to terrain map: /terrain_map_ext -> world/pointcloud/terrain_map_ext"
-            )
-        else:
-            self.get_logger().info("Skipping subscription to /terrain_map_ext (LOG_TERRAIN_MAP=False)")
 
         if LOG_COLORED_REGISTERED_SCAN:
             self.create_subscription(
@@ -677,13 +588,7 @@ class HabitatToRerun(Node):
                 lambda msg: self.cb_pointcloud(msg, "world/pointcloud/colored_registered_scan"),
                 pc_qos,
             )
-            self.get_logger().info(
-                "Subscribed to colored point cloud: /colored_registered_scan -> world/pointcloud/colored_registered_scan"
-            )
-        else:
-            self.get_logger().info("Skipping subscription to /colored_registered_scan (LOG_COLORED_REGISTERED_SCAN=False)")
 
-        # Occupancy grid
         if LOG_OCCUPANCY_GRID:
             self.create_subscription(
                 OccupancyGrid,
@@ -691,27 +596,17 @@ class HabitatToRerun(Node):
                 self.cb_occupancy_grid,
                 qos_best_effort(1),
             )
-            self.get_logger().info(
-                "Subscribed to occupancy grid: /occupancy_grid -> world/occupancy_grid"
-            )
 
-        # IMU / Odom / TF
         self.create_subscription(Imu, "/habitatsim/imu/data", self.cb_imu, 50)
         self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 20)
         self.create_subscription(
-            TFMessage,
-            "/tf",
-            lambda m: self.cb_tf(m, static=False),
-            qos_tf(False),
+            TFMessage, "/tf", lambda m: self.cb_tf(m, static=False), qos_tf(False)
         )
         self.create_subscription(
-            TFMessage,
-            "/tf_static",
-            lambda m: self.cb_tf(m, static=True),
-            qos_tf(True),
+            TFMessage, "/tf_static", lambda m: self.cb_tf(m, static=True), qos_tf(True)
         )
 
-        self.get_logger().info("Habitat → Rerun node with camera_lowres Pinhole logging running.")
+        self.get_logger().info("Habitat → Rerun node with MAP-frame logging running.")
 
     # --- Cameras -------------------------------------------------------
 
@@ -729,42 +624,16 @@ class HabitatToRerun(Node):
         )
 
         try:
-            rr.log(
-                base_entity,
-                rr.Pinhole(
-                    image_from_camera=K,
-                    resolution=[width, height],
-                ),
-            )
+            rr.log(base_entity, rr.Pinhole(image_from_camera=K, resolution=[width, height]))
             self.pinhole_logged.add(base_entity)
-            self.get_logger().info(
-                f"Logged Pinhole for {base_entity} (w={width}, h={height}, "
-                f"fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy})"
-            )
-        except TypeError as e:
-            self.get_logger().warn(
-                f"Pinhole(image_from_camera=..., resolution=...) failed for "
-                f"{base_entity} ({e}); trying resolution-only fallback."
-            )
+        except TypeError:
             try:
-                rr.log(
-                    base_entity,
-                    rr.Pinhole(
-                        resolution=[width, height],
-                    ),
-                )
+                rr.log(base_entity, rr.Pinhole(resolution=[width, height]))
                 self.pinhole_logged.add(base_entity)
-                self.get_logger().info(
-                    f"Logged fallback Pinhole (resolution-only) for {base_entity}"
-                )
             except Exception as e2:
-                self.get_logger().warn(
-                    f"Failed to log Pinhole for {base_entity}: {e2}"
-                )
+                self.get_logger().warn(f"Failed to log Pinhole for {base_entity}: {e2}")
         except Exception as e:
-            self.get_logger().warn(
-                f"Failed to log Pinhole for {base_entity}: {e}"
-            )
+            self.get_logger().warn(f"Failed to log Pinhole for {base_entity}: {e}")
 
     def cb_rgb_camera_lowres(self, msg: CompressedImage, base_entity: str):
         entity_path = f"{base_entity}/bgr"
@@ -784,17 +653,11 @@ class HabitatToRerun(Node):
                 mime = "image/png"
             else:
                 mime = "image/jpeg"
-                self.get_logger().warn(
-                    f"{entity_path}: unknown compressed image format; assuming jpeg"
-                )
+                self.get_logger().warn(f"{entity_path}: unknown image format; assuming jpeg")
 
         target_res = self.camera_depth_res.get(base_entity, None)
         if target_res is None or self._cv2 is None:
-            ok = send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
-            if not ok:
-                self.get_logger().warn(
-                    f"{entity_path}: encoded image logging ultimately failed (skipped)"
-                )
+            send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
             return
 
         target_w, target_h = target_res
@@ -803,155 +666,87 @@ class HabitatToRerun(Node):
             np_data = np.frombuffer(raw_data, dtype=np.uint8)
             img_bgr = self._cv2.imdecode(np_data, self._cv2.IMREAD_COLOR)
             if img_bgr is None:
-                self.get_logger().warn(
-                    f"{entity_path}: cv2.imdecode failed; logging original image."
-                )
-                ok = send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
-                if not ok:
-                    self.get_logger().warn(
-                        f"{entity_path}: encoded image logging ultimately failed (skipped)"
-                    )
+                send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
                 return
 
-            resized = self._cv2.resize(
-                img_bgr,
-                (target_w, target_h),
-                interpolation=self._cv2.INTER_AREA,
-            )
-
+            resized = self._cv2.resize(img_bgr, (target_w, target_h), interpolation=self._cv2.INTER_AREA)
             success, buf = self._cv2.imencode(".jpg", resized)
             if not success:
-                self.get_logger().warn(
-                    f"{entity_path}: cv2.imencode failed; logging original image."
-                )
-                ok = send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
-                if not ok:
-                    self.get_logger().warn(
-                        f"{entity_path}: encoded image logging ultimately failed (skipped)"
-                    )
+                send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
                 return
 
             resized_bytes = buf.tobytes()
-            ok = send_encoded_image(self.get_logger(), entity_path, resized_bytes, "image/jpeg")
-            if not ok:
-                self.get_logger().warn(
-                    f"{entity_path}: resized encoded image logging ultimately failed (skipped)"
-                )
-
+            send_encoded_image(self.get_logger(), entity_path, resized_bytes, "image/jpeg")
         except Exception as e:
-            self.get_logger().warn(
-                f"{entity_path}: RGB resize failed ({e}); logging original image."
-            )
-            ok = send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
-            if not ok:
-                self.get_logger().warn(
-                    f"{entity_path}: encoded image logging ultimately failed (skipped)"
-                )
+            self.get_logger().warn(f"{entity_path}: RGB resize failed ({e}); logging original.")
+            send_encoded_image(self.get_logger(), entity_path, raw_data, mime)
 
     def cb_detection_image(self, msg: Image, base_entity: str):
-        """
-        Log detection result image at <base_entity>/detection.
-
-        sensor_msgs/Image (BGR in ROS) -> RGB numpy -> (optional) resize to depth resolution -> rr.Image
-        """
         entity_path = f"{base_entity}/detection"
 
         try:
-            img_rgb = color_image_from_ros(msg)  # returns RGB
+            img_rgb = color_image_from_ros(msg)
         except Exception as e:
-            self.get_logger().warn(
-                f"{entity_path}: detection image convert failed: {e}\n{traceback.format_exc()}"
-            )
+            self.get_logger().warn(f"{entity_path}: detection image convert failed: {e}")
             return
 
         target_res = self.camera_depth_res.get(base_entity, None)
         if target_res is not None and self._cv2 is not None:
             target_w, target_h = target_res
             try:
-                resized = self._cv2.resize(
-                    img_rgb,
-                    (target_w, target_h),
-                    interpolation=self._cv2.INTER_AREA,
-                )
-                img_to_log = resized
+                img_rgb = self._cv2.resize(img_rgb, (target_w, target_h), interpolation=self._cv2.INTER_AREA)
             except Exception as e:
-                self.get_logger().warn(
-                    f"{entity_path}: detection resize failed ({e}); logging original size."
-                )
-                img_to_log = img_rgb
-        else:
-            img_to_log = img_rgb
+                self.get_logger().warn(f"{entity_path}: detection resize failed ({e}); using original.")
 
         try:
-            rr.log(entity_path, rr.Image(img_to_log))
+            rr.log(entity_path, rr.Image(img_rgb))
         except Exception as e:
-            self.get_logger().warn(
-                f"{entity_path}: rr.Image logging failed: {e}"
-            )
+            self.get_logger().warn(f"{entity_path}: rr.Image logging failed: {e}")
 
-    def cb_depth_camera_lowres(self, msg: Image, base_entity: str):
+    def cb_depth_camera_lowres(self, msg: Image, base_entity: str, cam_name: str):
         entity_path = f"{base_entity}/depth"
 
-        # Remember this camera's depth resolution
         self.camera_depth_res[base_entity] = (msg.width, msg.height)
-
-        # 1) Pinhole (once), independent of whether we log depth frames
         self.maybe_log_pinhole_for_camera(base_entity, msg.width, msg.height)
 
-        # 2) Depth image (optional, controlled by LOG_DEPTH_IMAGES)
         if LOG_DEPTH_IMAGES:
             try:
                 depth_m = depth_array_from_ros(msg)
-                ok = send_depth_image(self.get_logger(), entity_path, depth_m)
-                if not ok:
-                    self.get_logger().warn(
-                        f"{entity_path}: depth logging ultimately failed (skipped)"
-                    )
+                send_depth_image(self.get_logger(), entity_path, depth_m)
             except Exception as e:
-                self.get_logger().warn(
-                    f"Depth convert/log failed on {entity_path}: {e}\n{traceback.format_exc()}"
-                )
+                self.get_logger().warn(f"Depth convert/log failed on {entity_path}: {e}")
 
-        # 3) Pose (always logged)
-        self.log_camera_pose_from_depth_msg(msg, base_entity)
+        self.log_camera_pose_via_tf(base_entity, cam_name)
 
-    def log_camera_pose_from_depth_msg(self, depth_msg: Image, base_entity: str):
-        """
-        Compute world_from_camera (map_from_camera) using:
-          - TF:   BASE_FRAME -> depth_msg.header.frame_id  (base_from_camera)
-          - Odom: self.current_odom                       (map_from_base)
-        and log rr.Transform3D at base_entity.
-        """
-        if not self.has_odom or self.current_odom is None:
+    def log_camera_pose_via_tf(self, base_entity: str, cam_name: str):
+        cam_cfg = self.camera_configs.get(cam_name)
+        if not cam_cfg:
             return
 
-        camera_frame = depth_msg.header.frame_id
+        camera_frame = cam_cfg.get("frame")
+        if not camera_frame:
+            return
+
         try:
             tfs = self.tf_buffer.lookup_transform(
-                BASE_FRAME,      # target (base)
-                camera_frame,    # source (camera)
-                rclpy.time.Time(),
+                MAP_FRAME, camera_frame, rclpy.time.Time()
             )
-        except Exception:
+        except Exception as e:
+            self.get_logger().warn(
+                f"TF lookup failed for camera {camera_frame} -> {MAP_FRAME}: {e}"
+            )
             return
 
-        pos = self.current_odom.pose.pose.position
-        quat = self.current_odom.pose.pose.orientation
-        T_map_base = transform_to_matrix(
-            (pos.x, pos.y, pos.z),
-            (quat.x, quat.y, quat.z, quat.w),
+        T_map_cam = transform_to_matrix(
+            (tfs.transform.translation.x,
+             tfs.transform.translation.y,
+             tfs.transform.translation.z),
+            (tfs.transform.rotation.x,
+             tfs.transform.rotation.y,
+             tfs.transform.rotation.z,
+             tfs.transform.rotation.w),
         )
-
-        t = tfs.transform.translation
-        q = tfs.transform.rotation
-        T_base_camera = transform_to_matrix(
-            (t.x, t.y, t.z),
-            (q.x, q.y, q.z, q.w),
-        )
-
-        T_map_camera = T_map_base @ T_base_camera
-
-        trans, quat_cam = matrix_to_transform(T_map_camera)
+        trans, quat_cam = matrix_to_transform(T_map_cam)
         translation = [float(trans[0]), float(trans[1]), float(trans[2])]
         quaternion = [
             float(quat_cam[0]),
@@ -963,26 +758,14 @@ class HabitatToRerun(Node):
         try:
             rr.log(
                 base_entity,
-                rr.Transform3D(
-                    translation=translation,
-                    quaternion=quaternion,
-                ),
+                rr.Transform3D(translation=translation, quaternion=quaternion),
             )
         except Exception as e:
-            self.get_logger().warn(
-                f"Failed to log camera pose at {base_entity}: {e}"
-            )
+            self.get_logger().warn(f"Failed to log camera pose at {base_entity}: {e}")
 
     # --- Pointcloud / IMU / occupancy / odom / TF ----------------------
 
     def cb_pointcloud(self, msg: PointCloud2, entity_path: str):
-        """
-        Handle both terrain and colored point clouds with:
-          - pre-decode frame throttling (LOG_EVERY_N),
-          - decode-time downsampling (stride),
-          - decode-time max point cap.
-        """
-        # Decide which config to use based on entity_path
         if entity_path.endswith("terrain_map_ext"):
             stride = max(1, int(TERRAIN_DOWNSAMPLE_STRIDE))
             max_points = TERRAIN_MAX_POINTS if TERRAIN_MAX_POINTS and TERRAIN_MAX_POINTS > 0 else None
@@ -994,74 +777,163 @@ class HabitatToRerun(Node):
             every_n = max(1, int(COLORED_LOG_EVERY_N))
             counter_attr = "_colored_pc_count"
         else:
-            # Unknown pointcloud path: decode with no throttling/downsampling
             pts, colors = pointcloud2_to_xyz_and_color_downsampled(self.get_logger(), msg, stride=1, max_points=None)
+            pts = self._transform_points_to_map(msg.header.frame_id, pts)
             send_point_cloud(self.get_logger(), entity_path, pts, colors)
             return
 
-        # 1) frame throttling BEFORE decoding
         if counter_attr is not None:
             count = getattr(self, counter_attr, 0) + 1
             setattr(self, counter_attr, count)
             if count % every_n != 0:
                 return
 
-        # 2) decode with stride + max_points baked in
         pts, colors = pointcloud2_to_xyz_and_color_downsampled(
             self.get_logger(), msg, stride=stride, max_points=max_points
         )
 
+        pts_map = self._transform_points_to_map(msg.header.frame_id, pts)
+
         self.get_logger().info(
-            f"{entity_path}: logging {pts.shape[0]} points (stride={stride}, max_points={max_points}, every_n={every_n})"
+            f"{entity_path}: logging {pts_map.shape[0]} points "
+            f"(stride={stride}, max_points={max_points}, every_n={every_n})"
         )
 
-        send_point_cloud(self.get_logger(), entity_path, pts, colors)
+        send_point_cloud(self.get_logger(), entity_path, pts_map, colors)
+
+    def _transform_points_to_map(self, source_frame: str, pts: np.ndarray) -> np.ndarray:
+        if pts.size == 0:
+            return pts
+
+        if not source_frame or source_frame == MAP_FRAME:
+            return pts
+
+        try:
+            tfs = self.tf_buffer.lookup_transform(
+                MAP_FRAME, source_frame, rclpy.time.Time()
+            )
+        except Exception as e:
+            self.get_logger().warn(
+                f"TF lookup failed for pointcloud {source_frame} -> {MAP_FRAME}: {e}"
+            )
+            return pts
+
+        T_map_from_src = transform_to_matrix(
+            (tfs.transform.translation.x,
+             tfs.transform.translation.y,
+             tfs.transform.translation.z),
+            (tfs.transform.rotation.x,
+             tfs.transform.rotation.y,
+             tfs.transform.rotation.z,
+             tfs.transform.rotation.w),
+        )
+        R = T_map_from_src[:3, :3]
+        t = T_map_from_src[:3, 3]
+
+        pts_map = (R @ pts.T).T + t
+        return pts_map
 
     def cb_occupancy_grid(self, msg: OccupancyGrid):
-        """
-        Visualize OccupancyGrid as an image with a transform, under:
-
-          world/occupancy_grid          (Transform3D origin pose)
-          world/occupancy_grid/image    (rr.Image RGB)
-        """
         if msg.info.width == 0 or msg.info.height == 0:
+            return
+
+        if LOG_OCCUPANCY_ONCE and self._occupancy_logged_once:
             return
 
         w = msg.info.width
         h = msg.info.height
+        res = msg.info.resolution
 
-        # data is row-major, int8 [-1, 0..100]
+        grid_frame = msg.header.frame_id or MAP_FRAME
+
+        if grid_frame != MAP_FRAME:
+            self.get_logger().warn(
+                f"OccupancyGrid frame_id {grid_frame} != MAP_FRAME {MAP_FRAME}; "
+                f"this code assumes they are the same."
+            )
+
         data = np.array(msg.data, dtype=np.int16).reshape((h, w))
 
-        # Map: unknown -> 128, free (0) -> 0, occupied (>0) -> 255
         img = np.zeros((h, w), dtype=np.uint8)
-        img[data < 0] = 128      # unknown
-        img[data == 0] = 0       # free
-        img[data > 0] = 255      # occupied (you can tune this mapping)
+        img[data < 0] = 128
+        img[data == 0] = 0
+        img[data > 0] = 255
 
-        # Make RGB for Rerun
         rgb = np.stack([img, img, img], axis=-1)
 
-        # Log origin pose as Transform3D
         origin = msg.info.origin
         p = origin.position
         q = origin.orientation
+
+        # Log origin transform INCLUDING manual offset
         try:
             rr.log(
                 "world/occupancy_grid",
                 rr.Transform3D(
-                    translation=[p.x, p.y, p.z],
+                    translation=[p.x + OCC_OFFSET_X, p.y + OCC_OFFSET_Y, p.z],
                     quaternion=[q.x, q.y, q.z, q.w],
                 ),
+                static=LOG_OCCUPANCY_ONCE,
             )
         except Exception as e:
             self.get_logger().warn(f"Failed to log occupancy_grid transform: {e}")
 
-        # Log image
         try:
             rr.log("world/occupancy_grid/image", rr.Image(rgb))
         except Exception as e:
             self.get_logger().warn(f"Failed to log occupancy_grid image: {e}")
+
+        occ_thresh = 50
+        free_thresh = 10
+
+        flat = data.reshape(-1)
+        known_mask = flat >= 0
+        if not np.any(known_mask):
+            return
+
+        js, is_ = np.indices((h, w))
+        is_flat = is_.reshape(-1)
+        js_flat = js.reshape(-1)
+
+        is_known = is_flat[known_mask]
+        js_known = js_flat[known_mask]
+        vals_known = flat[known_mask]
+
+        x_local = (is_known.astype(np.float32) + 0.5) * res
+        y_local = (js_known.astype(np.float32) + 0.5) * res
+        z_local = np.zeros_like(x_local)
+
+        pts_local = np.stack([x_local, y_local, z_local], axis=-1)
+
+        R_origin = quat_to_matrix(q.x, q.y, q.z, q.w)
+        t_origin = np.array([p.x, p.y, p.z], dtype=np.float32)
+        pts_map = (R_origin @ pts_local.T).T + t_origin
+
+        # Manual 2D offset alignment
+        pts_map[:, 0] += OCC_OFFSET_X
+        pts_map[:, 1] += OCC_OFFSET_Y
+
+        colors = np.zeros((pts_map.shape[0], 3), dtype=np.uint8)
+
+        unknown_mask = vals_known < 0
+        free_mask = (vals_known >= 0) & (vals_known <= free_thresh)
+        occ_mask = vals_known > occ_thresh
+
+        colors[unknown_mask] = np.array([128, 128, 128], dtype=np.uint8)
+        colors[free_mask] = np.array([50, 50, 50], dtype=np.uint8)
+        colors[occ_mask] = np.array([255, 0, 0], dtype=np.uint8)
+
+        try:
+            rr.log(
+                "world/occupancy_grid/cells",
+                rr.Points3D(positions=pts_map, colors=colors),
+                static=LOG_OCCUPANCY_ONCE,
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log occupancy_grid cells as Points3D: {e}")
+
+        if LOG_OCCUPANCY_ONCE:
+            self._occupancy_logged_once = True
 
     def cb_imu(self, msg: Imu):
         try:
@@ -1084,18 +956,27 @@ class HabitatToRerun(Node):
     def cb_odom(self, msg: Odometry):
         self.current_odom = msg
         self.has_odom = True
+
         try:
-            p = msg.pose.pose.position
-            q = msg.pose.pose.orientation
+            tfs = self.tf_buffer.lookup_transform(
+                MAP_FRAME, BASE_FRAME, rclpy.time.Time()
+            )
             rr.log(
                 "world/base",
                 rr.Transform3D(
-                    translation=[p.x, p.y, p.z],
-                    quaternion=[q.x, q.y, q.z, q.w],
+                    translation=[tfs.transform.translation.x,
+                                 tfs.transform.translation.y,
+                                 tfs.transform.translation.z],
+                    quaternion=[tfs.transform.rotation.x,
+                                tfs.transform.rotation.y,
+                                tfs.transform.rotation.z,
+                                tfs.transform.rotation.w],
                 ),
             )
         except Exception as e:
-            self.get_logger().warn(f"Failed to log base pose from odom: {e}")
+            self.get_logger().warn(
+                f"Failed to log base pose in MAP_FRAME={MAP_FRAME}: {e}"
+            )
 
     def cb_tf(self, msg: TFMessage, static: bool):
         try:
