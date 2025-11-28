@@ -31,6 +31,8 @@ except ImportError:
 # ----------------------------------------------------------------------
 # Flags
 # ----------------------------------------------------------------------
+LOG_RGB_IMAGES = False
+LOG_DETECTION_IMAGES = True
 LOG_DEPTH_IMAGES = False
 LOG_TERRAIN_MAP = False
 LOG_COLORED_REGISTERED_SCAN = False
@@ -566,13 +568,16 @@ class HabitatToRerun(Node):
             depth_topic = cfg["depth_topic"]
             detection_topic = cfg["detection_topic"]
 
-            self.create_subscription(
-                CompressedImage,
-                rgb_topic,
-                lambda msg, base=base_entity: self.cb_rgb_camera_lowres(msg, base),
-                img_qos,
-            )
+            # RGB images (optional)
+            if LOG_RGB_IMAGES:
+                self.create_subscription(
+                    CompressedImage,
+                    rgb_topic,
+                    lambda msg, base=base_entity: self.cb_rgb_camera_lowres(msg, base),
+                    img_qos,
+                )
 
+            # Depth images (depth logging already controlled inside cb_depth via LOG_DEPTH_IMAGES)
             self.create_subscription(
                 Image,
                 depth_topic,
@@ -580,12 +585,14 @@ class HabitatToRerun(Node):
                 img_qos,
             )
 
-            self.create_subscription(
-                Image,
-                detection_topic,
-                lambda msg, base=base_entity: self.cb_detection_image(msg, base),
-                img_qos,
-            )
+            # Detection images (optional)
+            if LOG_DETECTION_IMAGES:
+                self.create_subscription(
+                    Image,
+                    detection_topic,
+                    lambda msg, base=base_entity: self.cb_detection_image(msg, base),
+                    img_qos,
+                )
 
         pc_qos = qos_best_effort(10)
 
