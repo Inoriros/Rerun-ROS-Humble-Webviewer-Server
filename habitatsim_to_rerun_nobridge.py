@@ -16,8 +16,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
+# Added PointStamped to imports
 from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
 from nav_msgs.msg import Odometry, OccupancyGrid
+from geometry_msgs.msg import PointStamped
 from tf2_msgs.msg import TFMessage
 
 import rerun as rr
@@ -31,13 +33,29 @@ except ImportError:
 # ----------------------------------------------------------------------
 # Flags
 # ----------------------------------------------------------------------
+# Flags for image logging
 LOG_RGB_IMAGES = False
 LOG_DETECTION_IMAGES = True
 LOG_DEPTH_IMAGES = False
+
+# Flags for point cloud logging
 LOG_TERRAIN_MAP = False
 LOG_COLORED_REGISTERED_SCAN = False
+
+# Flags for occupancy grid logging
 LOG_OCCUPANCY_GRID = True
 LOG_OCCUPANCY_ONCE = False  # if map is static, can log once
+
+# Flags for candidate goal points - frontiers points, target object points, selected goal point
+LOG_FRONTIERS = True
+LOG_TARGETS = True
+LOG_GOAL = True
+LOG_WAYPOINT = True
+
+# Flags for value map logging
+LOG_VALUE_SCAN = True
+LOG_EXPLORED_VALUE_MAP = False
+
 
 TERRAIN_DOWNSAMPLE_STRIDE = 4
 COLORED_DOWNSAMPLE_STRIDE = 4
@@ -54,27 +72,14 @@ BASE_FRAME = "spot/body"
 DEFAULT_ODOM_TOPIC = "/spot/platform/odom"
 
 # Manual spatial offset applied to the occupancy grid (in MAP_FRAME, meters).
-#
-# Why this is needed:
-# The mapping system that publishes the OccupancyGrid uses a shifted origin:
-#     Occ/mapOriginX = -30.0
-#     Occ/mapOriginY = -30.0
-# meaning the (0,0) cell is located 30 meters away from the map frame origin
-# (i.e., the map is defined as a 60m x 60m area centered around (0,0)).
-#
-# Our robot pointclouds and camera poses, however, are centered near (0,0)
-# in the map frame and do NOT apply this -30m origin shift.
-#
-# To visually align the occupancy grid with the robot and pointclouds in Rerun,
-# we add back HALF of that map-origin shift (+15m, +15m). This brings the
-# occupancy map's "visual center" into the same coordinate space as the robot.
-#
-# If your map size or origin changes, adjust these values accordingly.
 OCC_OFFSET_X = 15.0
 OCC_OFFSET_Y = 15.0
 
-
-
+# Colors: obstacle/occupied cells should use pure red; other visuals must avoid red.
+# `OCCUPIED_COLOR` is the obstacle grid color (pure red). The rainbow colormap
+# endpoint remains orange to avoid colliding with obstacle red in overlays.
+OCCUPIED_COLOR = np.array([255, 0, 0], dtype=np.uint8)
+RAINBOW_HIGH_RGB = np.array([255, 128, 0], dtype=np.uint8)
 # -----------------------------------------------------------------------------
 
 
@@ -394,16 +399,67 @@ def pointcloud2_to_xyz_and_color_downsampled(logger, msg: PointCloud2, stride: i
         return np.zeros((0, 3), np.float32), None
 
 
-def send_point_cloud(logger, entity_path: str, pts: np.ndarray, colors):
+def send_point_cloud(logger, entity_path: str, pts: np.ndarray, colors, radius=None):
     if pts.size == 0:
         return
     try:
-        if colors is None:
-            rr.log(entity_path, rr.Points3D(positions=pts))
-        else:
-            rr.log(entity_path, rr.Points3D(positions=pts, colors=colors))
+        # Construct kwargs dynamically to handle older/newer Rerun versions or missing radius
+        kwargs = {"positions": pts}
+        if colors is not None:
+            kwargs["colors"] = colors
+        if radius is not None:
+            kwargs["radii"] = radius
+            
+        rr.log(entity_path, rr.Points3D(**kwargs))
     except Exception as e:
         logger.warn(f"Failed to log point cloud for {entity_path}: {e}")
+
+
+def rainbow_colormap(values: np.ndarray) -> np.ndarray:
+    """
+    Map scalar values in [0, 1] -> RGB uint8 using a smooth multi-stop gradient:
+    0.0  -> blue    (0, 0, 255)
+    0.25 -> cyan    (0, 255, 255)
+    0.5  -> green   (0, 255, 0)
+    0.75 -> yellow  (255, 255, 0)
+    1.0  -> orange  (255, 128, 0)  -- avoids pure red reserved for obstacles
+    
+    Uses linear interpolation between stops for smooth transitions.
+    """
+    v = np.clip(np.asarray(values, dtype=np.float32).ravel(), 0.0, 1.0)
+    
+    # Define color stops: (value, R, G, B) normalized to [0, 1]
+    stops = np.array([
+        [0.00, 0.0,  0.0,  1.0],   # blue
+        [0.25, 0.0,  1.0,  1.0],   # cyan
+        [0.50, 0.0,  1.0,  0.0],   # green
+        [0.75, 1.0,  1.0,  0.0],   # yellow
+        [1.00, 1.0,  0.5,  0.0],   # orange
+    ], dtype=np.float32)
+    
+    # Output arrays
+    r = np.empty_like(v)
+    g = np.empty_like(v)
+    b = np.empty_like(v)
+    
+    # Interpolate between stops
+    for idx in range(len(stops) - 1):
+        t0, r0, g0, b0 = stops[idx]
+        t1, r1, g1, b1 = stops[idx + 1]
+        
+        mask = (v >= t0) & (v <= t1)
+        if not np.any(mask):
+            continue
+        
+        # Local interpolation factor in [0, 1]
+        t_local = (v[mask] - t0) / (t1 - t0 + 1e-9)
+        
+        r[mask] = r0 + (r1 - r0) * t_local
+        g[mask] = g0 + (g1 - g0) * t_local
+        b[mask] = b0 + (b1 - b0) * t_local
+    
+    colors = np.stack([r, g, b], axis=-1)
+    return (np.clip(colors, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def quat_to_matrix(x, y, z, w):
@@ -503,6 +559,17 @@ class HabitatToRerun(Node):
         self.rgb_cx = float(self.get_parameter("rgb_cx").get_parameter_value().double_value)
         self.rgb_cy = float(self.get_parameter("rgb_cy").get_parameter_value().double_value)
 
+        # Occupancy map Z value parameters
+        self.declare_parameter("value_occupancy_map_z", 0.1)
+        self.declare_parameter("value_occupancy_scan_z", 0.1)
+
+        self.value_occupancy_map_z = float(
+            self.get_parameter("value_occupancy_map_z").get_parameter_value().double_value
+        )
+        self.value_occupancy_scan_z = float(
+            self.get_parameter("value_occupancy_scan_z").get_parameter_value().double_value
+        )
+
         rr.init("habitatsim_rerun")
         ep = try_connect_grpc(self.get_logger(), host, port)
         self.get_logger().info(f"Rerun connected via {ep}")
@@ -596,6 +663,7 @@ class HabitatToRerun(Node):
 
         pc_qos = qos_best_effort(10)
 
+        # Point cloud subscriptions
         if LOG_TERRAIN_MAP:
             self.create_subscription(
                 PointCloud2,
@@ -611,6 +679,73 @@ class HabitatToRerun(Node):
                 lambda msg: self.cb_pointcloud(msg, "world/pointcloud/colored_registered_scan"),
                 pc_qos,
             )
+        
+        # Value occupancy map subscriptions (OccupancyGrid → points, using cb_occupancy_grid)
+        if LOG_VALUE_SCAN:
+            self.create_subscription(
+                OccupancyGrid,
+                "/value_occupancy_scan",
+                lambda msg: self.cb_value_occupancy_grid(
+                    msg,
+                    entity_base="world/value_occupancy_scan",
+                    plane_z=self.value_occupancy_scan_z,
+                ),
+                qos_best_effort(1),
+            )
+
+        if LOG_EXPLORED_VALUE_MAP:
+            self.create_subscription(
+                OccupancyGrid,
+                "/value_occupancy_map",
+                lambda msg: self.cb_value_occupancy_grid(
+                    msg,
+                    entity_base="world/value_occupancy_map",
+                    plane_z=self.value_occupancy_map_z,
+                ),
+                qos_best_effort(1),
+            )
+        
+
+            
+        # ----------------------------------------------------------------------
+        # NEW TOPICS INTEGRATION
+        # ----------------------------------------------------------------------
+        if LOG_TARGETS:
+             self.create_subscription(
+                PointCloud2,
+                "/target_object_points",
+                # Green [0, 255, 0], Radius 0.08 (approx 2x standard grid cell visual)
+                lambda msg: self.cb_marker_pointcloud(msg, "world/markers/target_object_points", [0, 255, 0], 0.08),
+                pc_qos,
+            )
+             
+        if LOG_FRONTIERS:
+             self.create_subscription(
+                PointCloud2,
+                "/frontier_points",
+                # Purple [148, 0, 211], Radius 0.08 (approx 2x standard grid cell visual)
+                lambda msg: self.cb_marker_pointcloud(msg, "world/markers/frontier_points", [148, 0, 211], 0.08),
+                pc_qos,
+            )
+        
+        # Selected goal point logging (white color, larger radius)
+        if LOG_GOAL:
+            self.create_subscription(
+                PointStamped,
+                "/selected_goal_point",
+                lambda msg: self.cb_point_stamped(msg, "world/markers/selected_goal_point", [255, 255, 255], 0.15),
+                qos_best_effort(10)
+            )
+
+        # Waypoint logging (yellow color, medium radius)
+        if LOG_WAYPOINT:
+            self.create_subscription(
+                PointStamped,
+                "/way_point",
+                lambda msg: self.cb_point_stamped(msg, "world/markers/way_point", [255, 255, 0], 0.12),
+                qos_best_effort(10)
+            )
+        # ----------------------------------------------------------------------
 
         if LOG_OCCUPANCY_GRID:
             self.create_subscription(
@@ -823,6 +958,54 @@ class HabitatToRerun(Node):
         )
 
         send_point_cloud(self.get_logger(), entity_path, pts_map, colors)
+        
+    def cb_marker_pointcloud(self, msg: PointCloud2, entity_path: str, color_rgb: list, radius: float):
+        """
+        Special callback for marker-like pointclouds (Targets, Frontiers)
+        Allows overriding color and radius.
+        """
+        # Extract points (ignore internal color)
+        pts, _ = pointcloud2_to_xyz_and_color_downsampled(self.get_logger(), msg, stride=1, max_points=None)
+        
+        # Transform to map frame
+        pts_map = self._transform_points_to_map(msg.header.frame_id, pts)
+        
+        if pts_map.size == 0:
+            return
+
+        # Create uniform color array
+        num_pts = pts_map.shape[0]
+        colors = np.tile(color_rgb, (num_pts, 1)).astype(np.uint8)
+        
+        # Log with explicit radius
+        send_point_cloud(self.get_logger(), entity_path, pts_map, colors, radius=radius)
+
+    def cb_point_stamped(self, msg: PointStamped, entity_path: str, color_rgb: list, radius: float):
+        """
+        Logs a single point with specified color and radius.
+        - Goal point: white [255, 255, 255], radius 0.15
+        - Waypoint: purple [148, 0, 211], radius 0.12
+        """
+        # Source point
+        pt = np.array([[msg.point.x, msg.point.y, msg.point.z]], dtype=np.float32)
+        
+        # Transform to map
+        pts_map = self._transform_points_to_map(msg.header.frame_id, pt)
+        
+        if pts_map.size == 0:
+            return
+            
+        try:
+            rr.log(
+                entity_path, 
+                rr.Points3D(
+                    positions=pts_map, 
+                    colors=color_rgb, 
+                    radii=radius
+                )
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log {entity_path}: {e}")
 
     def _transform_points_to_map(self, source_frame: str, pts: np.ndarray) -> np.ndarray:
         if pts.size == 0:
@@ -856,11 +1039,14 @@ class HabitatToRerun(Node):
         pts_map = (R @ pts.T).T + t
         return pts_map
 
-    def cb_occupancy_grid(self, msg: OccupancyGrid):
+    def cb_occupancy_grid(self, msg: OccupancyGrid, entity_base: str = "world/occupancy_grid", plane_z=None):
         if msg.info.width == 0 or msg.info.height == 0:
             return
 
-        if LOG_OCCUPANCY_ONCE and self._occupancy_logged_once:
+        # Is this the main /occupancy_grid or one of the value overlays?
+        is_main_grid = (entity_base == "world/occupancy_grid")
+
+        if is_main_grid and LOG_OCCUPANCY_ONCE and self._occupancy_logged_once:
             return
 
         w = msg.info.width
@@ -877,6 +1063,7 @@ class HabitatToRerun(Node):
 
         data = np.array(msg.data, dtype=np.int16).reshape((h, w))
 
+        # Grayscale image as before
         img = np.zeros((h, w), dtype=np.uint8)
         img[data < 0] = 128
         img[data == 0] = 0
@@ -888,23 +1075,32 @@ class HabitatToRerun(Node):
         p = origin.position
         q = origin.orientation
 
-        # Log origin transform INCLUDING manual offset
+        # Decide world Z for this grid:
+        # - None  → use origin z (main /occupancy_grid behaviour)
+        # - float → explicit plane height (for value layers)
+        if plane_z is None:
+            plane_z_used = p.z
+        else:
+            plane_z_used = float(plane_z)
+
+        # Log origin transform INCLUDING manual XY offset and custom Z
         try:
             rr.log(
-                "world/occupancy_grid",
+                entity_base,
                 rr.Transform3D(
-                    translation=[p.x + OCC_OFFSET_X, p.y + OCC_OFFSET_Y, p.z],
+                    translation=[p.x + OCC_OFFSET_X, p.y + OCC_OFFSET_Y, plane_z_used],
                     quaternion=[q.x, q.y, q.z, q.w],
                 ),
-                static=LOG_OCCUPANCY_ONCE,
+                static=is_main_grid and LOG_OCCUPANCY_ONCE,
             )
         except Exception as e:
-            self.get_logger().warn(f"Failed to log occupancy_grid transform: {e}")
+            self.get_logger().warn(f"Failed to log {entity_base} transform: {e}")
 
+        # Log image at the same subtree
         try:
-            rr.log("world/occupancy_grid/image", rr.Image(rgb))
+            rr.log(f"{entity_base}/image", rr.Image(rgb))
         except Exception as e:
-            self.get_logger().warn(f"Failed to log occupancy_grid image: {e}")
+            self.get_logger().warn(f"Failed to log {entity_base} image: {e}")
 
         occ_thresh = 50
         free_thresh = 10
@@ -929,10 +1125,11 @@ class HabitatToRerun(Node):
         pts_local = np.stack([x_local, y_local, z_local], axis=-1)
 
         R_origin = quat_to_matrix(q.x, q.y, q.z, q.w)
-        t_origin = np.array([p.x, p.y, p.z], dtype=np.float32)
+        # Use plane_z_used as the world Z for this layer
+        t_origin = np.array([p.x, p.y, plane_z_used], dtype=np.float32)
         pts_map = (R_origin @ pts_local.T).T + t_origin
 
-        # Manual 2D offset alignment
+        # Manual 2D offset alignment (same as before)
         pts_map[:, 0] += OCC_OFFSET_X
         pts_map[:, 1] += OCC_OFFSET_Y
 
@@ -944,19 +1141,145 @@ class HabitatToRerun(Node):
 
         colors[unknown_mask] = np.array([128, 128, 128], dtype=np.uint8)
         colors[free_mask] = np.array([50, 50, 50], dtype=np.uint8)
-        colors[occ_mask] = np.array([255, 0, 0], dtype=np.uint8)
+        colors[occ_mask] = OCCUPIED_COLOR
 
         try:
             rr.log(
-                "world/occupancy_grid/cells",
+                f"{entity_base}/cells",
                 rr.Points3D(positions=pts_map, colors=colors),
-                static=LOG_OCCUPANCY_ONCE,
+                static=is_main_grid and LOG_OCCUPANCY_ONCE,
             )
         except Exception as e:
-            self.get_logger().warn(f"Failed to log occupancy_grid cells as Points3D: {e}")
+            self.get_logger().warn(f"Failed to log {entity_base} cells as Points3D: {e}")
 
-        if LOG_OCCUPANCY_ONCE:
+        if is_main_grid and LOG_OCCUPANCY_ONCE:
             self._occupancy_logged_once = True
+
+    
+    def cb_value_occupancy_grid(self, msg: OccupancyGrid, entity_base: str, plane_z: float):
+        """
+        For /value_occupancy_map and /value_occupancy_scan:
+          - data = -1  : unknown  → no points
+          - data in [0, 1] (and a bit above) → scalar value
+          - data > 1   : treated as 1
+        Rendered as a rainbow-colored layer slightly above the main occupancy grid.
+        """
+        if msg.info.width == 0 or msg.info.height == 0:
+            return
+
+        w = msg.info.width
+        h = msg.info.height
+        res = msg.info.resolution
+
+        grid_frame = msg.header.frame_id or MAP_FRAME
+        if grid_frame != MAP_FRAME:
+            self.get_logger().warn(
+                f"Value OccupancyGrid frame_id {grid_frame} != MAP_FRAME {MAP_FRAME}; "
+                f"this code assumes they are the same."
+            )
+
+        # Values as float, shape (h, w)
+        # OccupancyGrid data is typically int8 with values in [0, 100] or [-1 for unknown]
+        # We need to normalize to [0, 1] for the colormap
+        data = np.array(msg.data, dtype=np.float32).reshape((h, w))
+
+        origin = msg.info.origin
+        p = origin.position
+        q = origin.orientation
+
+        # --- Select known cells: everything >= 0.0 ---
+        flat = data.reshape(-1)
+        known_mask = flat >= 0.0    # -1 (unknown) is skipped
+        if not np.any(known_mask):
+            return
+
+        js, is_ = np.indices((h, w))
+        is_flat = is_.reshape(-1)
+        js_flat = js.reshape(-1)
+
+        is_known = is_flat[known_mask]
+        js_known = js_flat[known_mask]
+        vals_known = flat[known_mask]
+
+        # Normalize values to [0, 1] range
+        # If values are already in [0, 1], this won't change them much
+        # If values are in [0, 100], this normalizes them properly
+        val_min = vals_known.min()
+        val_max = vals_known.max()
+        if val_max > 1.0:
+            # Data is likely in [0, 100] range, normalize
+            vals_clamped = np.clip(vals_known / 100.0, 0.0, 1.0)
+        elif val_max - val_min > 1e-6:
+            # Data has some range, normalize to full [0, 1]
+            vals_clamped = (vals_known - val_min) / (val_max - val_min)
+        else:
+            # All values are the same
+            vals_clamped = np.clip(vals_known, 0.0, 1.0)
+
+        # --- Compute 3D positions for the known cells ---
+        x_local = (is_known.astype(np.float32) + 0.5) * res
+        y_local = (js_known.astype(np.float32) + 0.5) * res
+        z_local = np.zeros_like(x_local)
+
+        pts_local = np.stack([x_local, y_local, z_local], axis=-1)
+
+        R_origin = quat_to_matrix(q.x, q.y, q.z, q.w)
+        # Put this layer at a configurable Z (plane_z)
+        t_origin = np.array([p.x, p.y, plane_z], dtype=np.float32)
+        pts_map = (R_origin @ pts_local.T).T + t_origin
+
+        # Manual XY offset, same as /occupancy_grid
+        pts_map[:, 0] += OCC_OFFSET_X
+        pts_map[:, 1] += OCC_OFFSET_Y
+
+        # --- Rainbow colors for the points ---
+        colors_pts = rainbow_colormap(vals_clamped)
+
+        try:
+            rr.log(
+                f"{entity_base}/cells",
+                rr.Points3D(positions=pts_map, colors=colors_pts),
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log {entity_base} value cells as Points3D: {e}")
+
+        # --- Optional: 2D rainbow image of the value field ---
+        try:
+            data_flat = data.reshape(-1)
+            img_colors = np.zeros((data_flat.shape[0], 3), dtype=np.uint8)
+
+            img_known_mask = data_flat >= 0.0
+            if np.any(img_known_mask):
+                img_vals = data_flat[img_known_mask]
+                # Use same normalization as for 3D points
+                img_val_min = img_vals.min()
+                img_val_max = img_vals.max()
+                if img_val_max > 1.0:
+                    img_vals_norm = np.clip(img_vals / 100.0, 0.0, 1.0)
+                elif img_val_max - img_val_min > 1e-6:
+                    img_vals_norm = (img_vals - img_val_min) / (img_val_max - img_val_min)
+                else:
+                    img_vals_norm = np.clip(img_vals, 0.0, 1.0)
+                img_colors[img_known_mask] = rainbow_colormap(img_vals_norm)
+
+            img_rgb = img_colors.reshape(h, w, 3)
+
+            rr.log(f"{entity_base}/image", rr.Image(img_rgb))
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log {entity_base} image: {e}")
+
+        # --- Transform for the layer (so Rerun knows where it lives in 3D) ---
+        try:
+            rr.log(
+                entity_base,
+                rr.Transform3D(
+                    translation=[p.x + OCC_OFFSET_X, p.y + OCC_OFFSET_Y, plane_z],
+                    quaternion=[q.x, q.y, q.z, q.w],
+                ),
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log {entity_base} transform: {e}")
+
 
     def cb_imu(self, msg: Imu):
         try:

@@ -29,22 +29,46 @@ sh start_rerun_web.sh
 You can descide to disable some topics, downsample some point clouds and log the point clouds less frequently by editing these parameters in the `habitatsim_to_rerun_nobridge.py` file:
 ```
 # ----------------------------------------------------------------------
-# Simple Python flags you can flip:
+# Flags
 # ----------------------------------------------------------------------
-LOG_DEPTH_IMAGES = False               # log per-camera depth images
-LOG_TERRAIN_MAP = True                 # subscribe/log /terrain_map_ext
-LOG_COLORED_REGISTERED_SCAN = True     # subscribe/log /colored_registered_scan
+# Flags for image logging
+LOG_RGB_IMAGES = False
+LOG_DETECTION_IMAGES = True
+LOG_DEPTH_IMAGES = False
 
-# Downsampling (stride >= 1; 1 = no downsampling)
-TERRAIN_DOWNSAMPLE_STRIDE = 4          # keep every N-th point from terrain
-COLORED_DOWNSAMPLE_STRIDE = 4          # keep every N-th point from colored cloud
+# Flags for point cloud logging
+LOG_TERRAIN_MAP = False
+LOG_COLORED_REGISTERED_SCAN = False
 
-# Hard caps on number of points per frame (None or 0 = no cap)
+# Flags for occupancy grid logging
+LOG_OCCUPANCY_GRID = True
+LOG_OCCUPANCY_ONCE = False  # if map is static, can log once
+
+# Flags for candidate goal points - frontiers points, target object points, selected goal point
+LOG_FRONTIERS = True
+LOG_TARGETS = True
+LOG_GOAL = True
+
+# Flags for value map logging
+LOG_VALUE_MAP = True
+LOG_EXPLORED_VALUE_MAP = False
+
+
+TERRAIN_DOWNSAMPLE_STRIDE = 4
+COLORED_DOWNSAMPLE_STRIDE = 4
+
 TERRAIN_MAX_POINTS = 20000
 COLORED_MAX_POINTS = 20000
 
-# Log only every N-th pointcloud message (per stream). 1 = log every frame.
 TERRAIN_LOG_EVERY_N = 2
 COLORED_LOG_EVERY_N = 2
-# ----------------------------------------------------------------------
+
+# Frames
+MAP_FRAME = "map"
+BASE_FRAME = "spot/body"
+DEFAULT_ODOM_TOPIC = "/spot/platform/odom"
+
+# Manual spatial offset applied to the occupancy grid (in MAP_FRAME, meters).
+OCC_OFFSET_X = 15.0
+OCC_OFFSET_Y = 15.0
 ```
