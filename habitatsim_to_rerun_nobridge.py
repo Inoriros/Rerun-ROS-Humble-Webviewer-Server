@@ -18,7 +18,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 
 # Added PointStamped to imports
 from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from geometry_msgs.msg import PointStamped
 from tf2_msgs.msg import TFMessage
 
@@ -51,6 +51,7 @@ LOG_FRONTIERS = True
 LOG_TARGETS = True
 LOG_GOAL = True
 LOG_WAYPOINT = True
+LOG_PATH = True
 
 # Flags for value map logging
 LOG_VALUE_SCAN = True
@@ -745,6 +746,15 @@ class HabitatToRerun(Node):
                 lambda msg: self.cb_point_stamped(msg, "world/markers/way_point", [255, 255, 0], 0.12),
                 qos_best_effort(10)
             )
+
+        # Path logging (yellow color)
+        if LOG_PATH:
+            self.create_subscription(
+                Path,
+                "/path",
+                lambda msg: self.cb_path(msg, "world/markers/path", [255, 255, 0], 0.05),
+                qos_best_effort(10)
+            )
         # ----------------------------------------------------------------------
 
         if LOG_OCCUPANCY_GRID:
@@ -1006,6 +1016,38 @@ class HabitatToRerun(Node):
             )
         except Exception as e:
             self.get_logger().warn(f"Failed to log {entity_path}: {e}")
+
+    def cb_path(self, msg: Path, entity_path: str, color_rgb: list, radius: float):
+        """
+        Logs a nav_msgs/Path as a line strip with specified color.
+        """
+        if len(msg.poses) == 0:
+            return
+
+        # Extract positions from all poses
+        pts = np.array(
+            [[pose.pose.position.x, pose.pose.position.y, pose.pose.position.z] for pose in msg.poses],
+            dtype=np.float32
+        )
+
+        # Transform to map frame
+        pts_map = self._transform_points_to_map(msg.header.frame_id, pts)
+
+        if pts_map.size == 0:
+            return
+
+        # Log as LineStrips3D for path visualization
+        try:
+            rr.log(
+                entity_path,
+                rr.LineStrips3D(
+                    strips=[pts_map],
+                    colors=[color_rgb],
+                    radii=radius
+                )
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log path {entity_path}: {e}")
 
     def _transform_points_to_map(self, source_frame: str, pts: np.ndarray) -> np.ndarray:
         if pts.size == 0:
