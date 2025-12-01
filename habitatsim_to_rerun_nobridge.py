@@ -22,6 +22,13 @@ from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from geometry_msgs.msg import PointStamped
 from tf2_msgs.msg import TFMessage
 
+# Import DetectedObjectArray for target object visualization
+try:
+    from mask_msgs.msg import DetectedObjectArray
+    HAS_MASK_MSGS = True
+except ImportError:
+    HAS_MASK_MSGS = False
+
 import rerun as rr
 import tf2_ros
 
@@ -712,13 +719,16 @@ class HabitatToRerun(Node):
         # NEW TOPICS INTEGRATION
         # ----------------------------------------------------------------------
         if LOG_TARGETS:
-             self.create_subscription(
-                PointCloud2,
-                "/target_object_points",
-                # Green [0, 255, 0], Radius 0.08 (approx 2x standard grid cell visual)
-                lambda msg: self.cb_marker_pointcloud(msg, "world/markers/target_object_points", [0, 255, 0], 0.08),
-                pc_qos,
-            )
+            if HAS_MASK_MSGS:
+                self.create_subscription(
+                    DetectedObjectArray,
+                    "/detected_objects",
+                    # Green [0, 255, 0], Radius 0.08 (approx 2x standard grid cell visual)
+                    lambda msg: self.cb_detected_objects(msg, "world/markers/detected_objects", [0, 255, 0], 0.08),
+                    pc_qos,
+                )
+            else:
+                self.get_logger().warn("mask_msgs not available; /detected_objects visualization disabled")
              
         if LOG_FRONTIERS:
              self.create_subscription(
@@ -989,6 +999,68 @@ class HabitatToRerun(Node):
         
         # Log with explicit radius
         send_point_cloud(self.get_logger(), entity_path, pts_map, colors, radius=radius)
+
+    def cb_detected_objects(self, msg, entity_path: str, color_rgb: list, radius: float):
+        """
+        Callback for DetectedObjectArray messages from /detected_objects topic.
+        Visualizes detected objects as colored points with labels.
+        Each object has: name, position (x, y, z), and confidence.
+        """
+        if len(msg.objects) == 0:
+            # Clear the visualization when no objects
+            try:
+                rr.log(entity_path, rr.Clear(recursive=False))
+            except Exception:
+                pass
+            return
+
+        # Extract positions from detected objects
+        pts = np.array(
+            [[obj.position.x, obj.position.y, obj.position.z] for obj in msg.objects],
+            dtype=np.float32
+        )
+
+        # Transform to map frame if needed
+        pts_map = self._transform_points_to_map(msg.header.frame_id, pts)
+
+        if pts_map.size == 0:
+            return
+
+        # Create colors based on confidence (higher confidence = brighter green)
+        num_pts = pts_map.shape[0]
+        colors = np.zeros((num_pts, 3), dtype=np.uint8)
+        for i, obj in enumerate(msg.objects):
+            # Scale green intensity by confidence (min 100, max 255)
+            intensity = int(100 + 155 * min(1.0, obj.confidence))
+            colors[i] = [0, intensity, 0]  # Green with varying intensity
+
+        # Log points
+        try:
+            rr.log(
+                entity_path,
+                rr.Points3D(
+                    positions=pts_map,
+                    colors=colors,
+                    radii=radius
+                )
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log detected objects at {entity_path}: {e}")
+
+        # Log labels for each detection
+        try:
+            labels = [f"{obj.name}: {obj.confidence:.2f}" for obj in msg.objects]
+            rr.log(
+                f"{entity_path}/labels",
+                rr.Points3D(
+                    positions=pts_map,
+                    labels=labels,
+                    radii=radius * 0.5  # Smaller radius for label points
+                )
+            )
+        except Exception as e:
+            # Labels might not be supported in all Rerun versions
+            pass
 
     def cb_point_stamped(self, msg: PointStamped, entity_path: str, color_rgb: list, radius: float):
         """

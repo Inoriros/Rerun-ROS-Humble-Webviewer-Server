@@ -16,8 +16,8 @@ tmux send-keys -t $SESSION_NAME:0 "$RERUN_CMD" C-m
 
 # --- Window 1: Habitat → Rerun Python Script ---
 tmux new-window -t $SESSION_NAME -n habitat_bridge
-# PYTHON_CMD="export ROS_DOMAIN_ID=88 && python3 habitatsim_to_rerun_nobridge.py"
-PYTHON_CMD="python3 habitatsim_to_rerun_nobridge.py"
+# Source ROS humble and SAIR_nav workspace for mask_msgs
+PYTHON_CMD="source /opt/ros/humble/setup.bash && source /root/SAIR_nav/install/setup.bash && python3 habitatsim_to_rerun_nobridge.py"
 tmux send-keys -t $SESSION_NAME:1 "$PYTHON_CMD" C-m
 
 
