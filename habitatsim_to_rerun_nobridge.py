@@ -21,6 +21,7 @@ from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from geometry_msgs.msg import PointStamped
 from tf2_msgs.msg import TFMessage
+from visualization_msgs.msg import Marker, MarkerArray
 
 # Import DetectedObjectArray for target object visualization
 try:
@@ -63,6 +64,11 @@ LOG_PATH = True
 # Flags for value map logging
 LOG_VALUE_SCAN = True
 LOG_EXPLORED_VALUE_MAP = False
+
+# Flags for SuperMap semantic mapping visualization
+LOG_SUPERMAP_OBJ_POINTS = True
+LOG_SUPERMAP_OBJ_BOXES = True
+LOG_SUPERMAP_ANNOTATED_IMAGES = True
 
 
 TERRAIN_DOWNSAMPLE_STRIDE = 4
@@ -775,6 +781,38 @@ class HabitatToRerun(Node):
                 qos_best_effort(1),
             )
 
+        # ----------------------------------------------------------------------
+        # SUPERMAP SEMANTIC MAPPING TOPICS
+        # ----------------------------------------------------------------------
+        # Object point cloud from SuperMap
+        if LOG_SUPERMAP_OBJ_POINTS:
+            self.create_subscription(
+                PointCloud2,
+                "/obj_points",
+                lambda msg: self.cb_supermap_obj_points(msg, "world/supermap/obj_points"),
+                pc_qos,
+            )
+
+        # Object bounding boxes from SuperMap
+        if LOG_SUPERMAP_OBJ_BOXES:
+            self.create_subscription(
+                MarkerArray,
+                "/obj_boxes",
+                lambda msg: self.cb_supermap_obj_boxes(msg, "world/supermap/obj_boxes"),
+                pc_qos,
+            )
+
+        # Annotated images from SuperMap (per camera)
+        if LOG_SUPERMAP_ANNOTATED_IMAGES:
+            supermap_camera_names = ["frontleft", "frontright", "left", "right", "back"]
+            for cam_name in supermap_camera_names:
+                self.create_subscription(
+                    Image,
+                    f"/annotated_image_{cam_name}",
+                    lambda msg, cam=cam_name: self.cb_supermap_annotated_image(msg, f"world/{cam}_camera_lowres/supermap_detection"),
+                    img_qos,
+                )
+
         self.create_subscription(Imu, "/habitatsim/imu/data", self.cb_imu, 50)
         self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 20)
         self.create_subscription(
@@ -1393,6 +1431,116 @@ class HabitatToRerun(Node):
             )
         except Exception as e:
             self.get_logger().warn(f"Failed to log {entity_base} transform: {e}")
+
+    # --- SuperMap Semantic Mapping Callbacks -----------------------------------
+
+    def cb_supermap_obj_points(self, msg: PointCloud2, entity_path: str):
+        """
+        Callback for SuperMap /obj_points topic.
+        Visualizes semantic object point clouds with their colors.
+        """
+        pts, colors = pointcloud2_to_xyz_and_color_downsampled(
+            self.get_logger(), msg, stride=1, max_points=None
+        )
+
+        # Transform to map frame if needed
+        pts_map = self._transform_points_to_map(msg.header.frame_id, pts)
+
+        if pts_map.size == 0:
+            return
+
+        # Log the object point cloud
+        try:
+            kwargs = {"positions": pts_map}
+            if colors is not None:
+                kwargs["colors"] = colors
+            kwargs["radii"] = 0.03  # Slightly larger points for visibility
+
+            rr.log(entity_path, rr.Points3D(**kwargs))
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log SuperMap obj_points at {entity_path}: {e}")
+
+    def cb_supermap_obj_boxes(self, msg: MarkerArray, entity_path: str):
+        """
+        Callback for SuperMap /obj_boxes topic.
+        Visualizes 3D bounding boxes for detected objects.
+        """
+        if len(msg.markers) == 0:
+            return
+
+        # Filter out DELETEALL markers and process only CUBE markers
+        boxes_positions = []
+        boxes_half_sizes = []
+        boxes_colors = []
+        boxes_labels = []
+
+        for marker in msg.markers:
+            if marker.action == Marker.DELETEALL:
+                continue
+            if marker.type != Marker.CUBE:
+                continue
+
+            # Get position
+            pos = [marker.pose.position.x, marker.pose.position.y, marker.pose.position.z]
+            
+            # Get half sizes from scale
+            half_size = [marker.scale.x / 2.0, marker.scale.y / 2.0, marker.scale.z / 2.0]
+            
+            # Get color
+            color = [
+                int(marker.color.r * 255),
+                int(marker.color.g * 255),
+                int(marker.color.b * 255),
+                int(marker.color.a * 255)
+            ]
+
+            # Get label from namespace or text
+            label = marker.ns if marker.ns else f"obj_{marker.id}"
+
+            boxes_positions.append(pos)
+            boxes_half_sizes.append(half_size)
+            boxes_colors.append(color)
+            boxes_labels.append(label)
+
+        if len(boxes_positions) == 0:
+            return
+
+        boxes_positions = np.array(boxes_positions, dtype=np.float32)
+        boxes_half_sizes = np.array(boxes_half_sizes, dtype=np.float32)
+        boxes_colors = np.array(boxes_colors, dtype=np.uint8)
+
+        # Transform positions to map frame if needed
+        # Note: Most markers are already in 'map' frame, but let's be safe
+        # For now, assume they're already in map frame since SuperMap publishes in 'map'
+
+        try:
+            rr.log(
+                entity_path,
+                rr.Boxes3D(
+                    centers=boxes_positions,
+                    half_sizes=boxes_half_sizes,
+                    colors=boxes_colors,
+                    labels=boxes_labels,
+                )
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Failed to log SuperMap obj_boxes at {entity_path}: {e}")
+
+    def cb_supermap_annotated_image(self, msg: Image, entity_path: str):
+        """
+        Callback for SuperMap /annotated_image_{cam_name} topics.
+        Visualizes detection-annotated images from semantic mapping.
+        """
+        try:
+            img_rgb = color_image_from_ros(msg)
+        except Exception as e:
+            self.get_logger().warn(f"{entity_path}: SuperMap annotated image convert failed: {e}")
+            return
+
+        try:
+            rr.log(entity_path, rr.Image(img_rgb))
+        except Exception as e:
+            self.get_logger().warn(f"{entity_path}: rr.Image logging failed: {e}")
 
 
     def cb_imu(self, msg: Imu):
