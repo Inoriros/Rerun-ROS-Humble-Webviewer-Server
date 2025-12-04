@@ -1537,6 +1537,16 @@ class HabitatToRerun(Node):
             self.get_logger().warn(f"{entity_path}: SuperMap annotated image convert failed: {e}")
             return
 
+        # Extract base_entity from entity_path (e.g., "world/frontleft_camera_lowres/supermap_detection" -> "world/frontleft_camera_lowres")
+        base_entity = "/".join(entity_path.split("/")[:-1])
+        target_res = self.camera_depth_res.get(base_entity, None)
+        if target_res is not None and self._cv2 is not None:
+            target_w, target_h = target_res
+            try:
+                img_rgb = self._cv2.resize(img_rgb, (target_w, target_h), interpolation=self._cv2.INTER_AREA)
+            except Exception as e:
+                self.get_logger().warn(f"{entity_path}: SuperMap annotated image resize failed ({e}); using original.")
+
         try:
             rr.log(entity_path, rr.Image(img_rgb))
         except Exception as e:
