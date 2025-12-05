@@ -1464,11 +1464,21 @@ class HabitatToRerun(Node):
         """
         Callback for SuperMap /obj_boxes topic.
         Visualizes 3D bounding boxes for detected objects.
+        Handles both CUBE markers and LINE_LIST markers (type 5) that define box edges.
         """
         if len(msg.markers) == 0:
             return
 
-        # Filter out DELETEALL markers and process only CUBE markers
+        # Collect all line strips from LINE_LIST markers
+        all_line_strips = []
+        all_line_colors = []
+        
+        # Collect label info: position and text for each marker
+        label_positions = []
+        label_texts = []
+        label_colors = []
+
+        # Also collect CUBE markers if any
         boxes_positions = []
         boxes_half_sizes = []
         boxes_colors = []
@@ -1477,15 +1487,7 @@ class HabitatToRerun(Node):
         for marker in msg.markers:
             if marker.action == Marker.DELETEALL:
                 continue
-            if marker.type != Marker.CUBE:
-                continue
 
-            # Get position
-            pos = [marker.pose.position.x, marker.pose.position.y, marker.pose.position.z]
-            
-            # Get half sizes from scale
-            half_size = [marker.scale.x / 2.0, marker.scale.y / 2.0, marker.scale.z / 2.0]
-            
             # Get color
             color = [
                 int(marker.color.r * 255),
@@ -1494,37 +1496,110 @@ class HabitatToRerun(Node):
                 int(marker.color.a * 255)
             ]
 
-            # Get label from namespace or text
-            label = marker.ns if marker.ns else f"obj_{marker.id}"
+            # Parse label from namespace - format is like "{'chair': 1}"
+            raw_ns = marker.ns if marker.ns else ""
+            # Try to parse the dict-like string to get clean name
+            try:
+                # Remove outer braces and parse
+                # Format: {'chair': 1} or {chair: 1}
+                import ast
+                parsed = ast.literal_eval(raw_ns)
+                if isinstance(parsed, dict):
+                    for obj_name, count in parsed.items():
+                        label = f"{obj_name} #{count}"
+                        break
+                else:
+                    label = raw_ns
+            except:
+                # Fallback: just use raw namespace
+                label = raw_ns if raw_ns else f"obj_{marker.id}"
 
-            boxes_positions.append(pos)
-            boxes_half_sizes.append(half_size)
-            boxes_colors.append(color)
-            boxes_labels.append(label)
+            if marker.type == Marker.LINE_LIST and len(marker.points) >= 2:
+                # LINE_LIST: points are pairs defining line segments
+                # Convert pairs of points into line segments
+                points = marker.points
+                
+                # Calculate centroid of box for label placement
+                all_x = [p.x for p in points]
+                all_y = [p.y for p in points]
+                all_z = [p.z for p in points]
+                centroid = [
+                    (min(all_x) + max(all_x)) / 2.0,
+                    (min(all_y) + max(all_y)) / 2.0,
+                    max(all_z) + 0.05  # Place label slightly above the top
+                ]
+                
+                for i in range(0, len(points) - 1, 2):
+                    p1 = points[i]
+                    p2 = points[i + 1]
+                    line_strip = np.array([
+                        [p1.x, p1.y, p1.z],
+                        [p2.x, p2.y, p2.z]
+                    ], dtype=np.float32)
+                    all_line_strips.append(line_strip)
+                    all_line_colors.append(color)
+                
+                # Store label info
+                label_positions.append(centroid)
+                label_texts.append(label)
+                label_colors.append(color)
 
-        if len(boxes_positions) == 0:
-            return
+            elif marker.type == Marker.CUBE:
+                # Handle CUBE markers as before
+                pos = [marker.pose.position.x, marker.pose.position.y, marker.pose.position.z]
+                half_size = [marker.scale.x / 2.0, marker.scale.y / 2.0, marker.scale.z / 2.0]
+                boxes_positions.append(pos)
+                boxes_half_sizes.append(half_size)
+                boxes_colors.append(color)
+                boxes_labels.append(label)
 
-        boxes_positions = np.array(boxes_positions, dtype=np.float32)
-        boxes_half_sizes = np.array(boxes_half_sizes, dtype=np.float32)
-        boxes_colors = np.array(boxes_colors, dtype=np.uint8)
-
-        # Transform positions to map frame if needed
-        # Note: Most markers are already in 'map' frame, but let's be safe
-        # For now, assume they're already in map frame since SuperMap publishes in 'map'
-
-        try:
-            rr.log(
-                entity_path,
-                rr.Boxes3D(
-                    centers=boxes_positions,
-                    half_sizes=boxes_half_sizes,
-                    colors=boxes_colors,
-                    labels=boxes_labels,
+        # Log LINE_LIST markers as LineStrips3D
+        if len(all_line_strips) > 0:
+            try:
+                rr.log(
+                    f"{entity_path}/lines",
+                    rr.LineStrips3D(
+                        strips=all_line_strips,
+                        colors=all_line_colors,
+                        radii=0.01,  # Line thickness
+                    )
                 )
-            )
-        except Exception as e:
-            self.get_logger().warn(f"Failed to log SuperMap obj_boxes at {entity_path}: {e}")
+            except Exception as e:
+                self.get_logger().warn(f"Failed to log SuperMap obj_boxes lines at {entity_path}: {e}")
+
+        # Log labels as Points3D with text labels
+        if len(label_positions) > 0:
+            try:
+                rr.log(
+                    f"{entity_path}/labels",
+                    rr.Points3D(
+                        positions=np.array(label_positions, dtype=np.float32),
+                        colors=np.array(label_colors, dtype=np.uint8),
+                        labels=label_texts,
+                        radii=0.02,  # Small point for label anchor
+                    )
+                )
+            except Exception as e:
+                self.get_logger().warn(f"Failed to log SuperMap obj_boxes labels at {entity_path}: {e}")
+
+        # Log CUBE markers as Boxes3D
+        if len(boxes_positions) > 0:
+            boxes_positions = np.array(boxes_positions, dtype=np.float32)
+            boxes_half_sizes = np.array(boxes_half_sizes, dtype=np.float32)
+            boxes_colors = np.array(boxes_colors, dtype=np.uint8)
+
+            try:
+                rr.log(
+                    f"{entity_path}/cubes",
+                    rr.Boxes3D(
+                        centers=boxes_positions,
+                        half_sizes=boxes_half_sizes,
+                        colors=boxes_colors,
+                        labels=boxes_labels,
+                    )
+                )
+            except Exception as e:
+                self.get_logger().warn(f"Failed to log SuperMap obj_boxes cubes at {entity_path}: {e}")
 
     def cb_supermap_annotated_image(self, msg: Image, entity_path: str):
         """
