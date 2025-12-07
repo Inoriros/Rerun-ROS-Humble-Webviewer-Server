@@ -66,9 +66,18 @@ LOG_VALUE_SCAN = True
 LOG_EXPLORED_VALUE_MAP = False
 
 # Flags for SuperMap semantic mapping visualization
-LOG_SUPERMAP_OBJ_POINTS = True
-LOG_SUPERMAP_OBJ_BOXES = True
-LOG_SUPERMAP_ANNOTATED_IMAGES = True
+LOG_SUPERMAP_OBJ_POINTS = False
+LOG_SUPERMAP_OBJ_BOXES = False
+LOG_SUPERMAP_ANNOTATED_IMAGES = False
+
+# Flags for DualMap semantic mapping visualization
+LOG_DUALMAP_LOCAL_SEMANTIC = True
+LOG_DUALMAP_GLOBAL_SEMANTIC = True
+LOG_DUALMAP_LOCAL_RGB = False  # RGB point clouds (optional, can be large)
+LOG_DUALMAP_GLOBAL_RGB = False
+LOG_DUALMAP_LOCAL_BBOXES = True  # Local map object bounding boxes
+LOG_DUALMAP_GLOBAL_BBOXES = True  # Global map object bounding boxes
+LOG_DUALMAP_ANNOTATED_IMAGES = True  # YOLO-World detection visualization (per camera)
 
 
 TERRAIN_DOWNSAMPLE_STRIDE = 4
@@ -615,30 +624,35 @@ class HabitatToRerun(Node):
                 "rgb_topic": "/spot/camera/frontleft/image/compressed",
                 "depth_topic": "/spot/depth/frontleft/image",
                 "detection_topic": "/proc_image/detection/image/frontleft",
+                "dualmap_annotated_topic": "/dualmap/annotated_image/frontleft",
                 "frame": "head_left_rgbd_optical",
             },
             "frontright": {
                 "rgb_topic": "/spot/camera/frontright/image/compressed",
                 "depth_topic": "/spot/depth/frontright/image",
                 "detection_topic": "/proc_image/detection/image/frontright",
+                "dualmap_annotated_topic": "/dualmap/annotated_image/frontright",
                 "frame": "head_right_rgbd_optical",
             },
             "left": {
                 "rgb_topic": "/spot/camera/left/image/compressed",
                 "depth_topic": "/spot/depth/left/image",
                 "detection_topic": "/proc_image/detection/image/left",
+                "dualmap_annotated_topic": "/dualmap/annotated_image/left",
                 "frame": "left_rgbd_optical",
             },
             "right": {
                 "rgb_topic": "/spot/camera/right/image/compressed",
                 "depth_topic": "/spot/depth/right/image",
                 "detection_topic": "/proc_image/detection/image/right",
+                "dualmap_annotated_topic": "/dualmap/annotated_image/right",
                 "frame": "right_rgbd_optical",
             },
             "back": {
                 "rgb_topic": "/spot/camera/back/image/compressed",
                 "depth_topic": "/spot/depth/back/image",
                 "detection_topic": "/proc_image/detection/image/back",
+                "dualmap_annotated_topic": "/dualmap/annotated_image/back",
                 "frame": "rear_rgbd_optical",
             },
         }
@@ -648,6 +662,7 @@ class HabitatToRerun(Node):
             rgb_topic = cfg["rgb_topic"]
             depth_topic = cfg["depth_topic"]
             detection_topic = cfg["detection_topic"]
+            dualmap_annotated_topic = cfg["dualmap_annotated_topic"]
 
             # RGB images (optional)
             if LOG_RGB_IMAGES:
@@ -672,6 +687,15 @@ class HabitatToRerun(Node):
                     Image,
                     detection_topic,
                     lambda msg, base=base_entity: self.cb_detection_image(msg, base),
+                    img_qos,
+                )
+
+            # DualMap annotated images (per camera)
+            if LOG_DUALMAP_ANNOTATED_IMAGES:
+                self.create_subscription(
+                    Image,
+                    dualmap_annotated_topic,
+                    lambda msg, base=base_entity: self.cb_dualmap_annotated_image_percam(msg, base),
                     img_qos,
                 )
 
@@ -812,6 +836,64 @@ class HabitatToRerun(Node):
                     lambda msg, cam=cam_name: self.cb_supermap_annotated_image(msg, f"world/{cam}_camera_lowres/supermap_detection"),
                     img_qos,
                 )
+
+        # ----------------------------------------------------------------------
+        # DUALMAP SEMANTIC MAPPING TOPICS
+        # ----------------------------------------------------------------------
+        # Local semantic map (real-time, actively maintained)
+        if LOG_DUALMAP_LOCAL_SEMANTIC:
+            self.create_subscription(
+                PointCloud2,
+                "/local_map/semantic",
+                lambda msg: self.cb_pointcloud(msg, "world/dualmap/local_semantic"),
+                pc_qos,
+            )
+
+        # Global semantic map (accumulated over time)
+        if LOG_DUALMAP_GLOBAL_SEMANTIC:
+            self.create_subscription(
+                PointCloud2,
+                "/global_map/semantic",
+                lambda msg: self.cb_pointcloud(msg, "world/dualmap/global_semantic"),
+                pc_qos,
+            )
+
+        # RGB point clouds from DualMap (optional, can be large)
+        if LOG_DUALMAP_LOCAL_RGB:
+            self.create_subscription(
+                PointCloud2,
+                "/local_map/rgb",
+                lambda msg: self.cb_pointcloud(msg, "world/dualmap/local_rgb"),
+                pc_qos,
+            )
+
+        if LOG_DUALMAP_GLOBAL_RGB:
+            self.create_subscription(
+                PointCloud2,
+                "/global_map/rgb",
+                lambda msg: self.cb_pointcloud(msg, "world/dualmap/global_rgb"),
+                pc_qos,
+            )
+
+        # DualMap bounding boxes
+        if LOG_DUALMAP_LOCAL_BBOXES:
+            self.create_subscription(
+                MarkerArray,
+                "/local_map/bboxes",
+                lambda msg: self.cb_dualmap_bboxes(msg, "world/dualmap/local_bboxes"),
+                10,
+            )
+
+        if LOG_DUALMAP_GLOBAL_BBOXES:
+            self.create_subscription(
+                MarkerArray,
+                "/global_map/bboxes",
+                lambda msg: self.cb_dualmap_bboxes(msg, "world/dualmap/global_bboxes"),
+                10,
+            )
+
+        # Note: DualMap annotated images are now per-camera, subscribed in the camera_configs loop above
+        # No centralized /annotated_image topic needed
 
         self.create_subscription(Imu, "/habitatsim/imu/data", self.cb_imu, 50)
         self.create_subscription(Odometry, self.odom_topic, self.cb_odom, 20)
@@ -1600,6 +1682,92 @@ class HabitatToRerun(Node):
                 )
             except Exception as e:
                 self.get_logger().warn(f"Failed to log SuperMap obj_boxes cubes at {entity_path}: {e}")
+
+    def cb_dualmap_bboxes(self, msg: MarkerArray, entity_path: str):
+        """
+        Callback for DualMap /global_map/bboxes topic.
+        Visualizes 3D bounding boxes for detected objects in the global map.
+        """
+        if len(msg.markers) == 0:
+            return
+
+        boxes_positions = []
+        boxes_half_sizes = []
+        boxes_colors = []
+        boxes_labels = []
+
+        for marker in msg.markers:
+            if marker.action == Marker.DELETEALL or marker.type != Marker.CUBE:
+                continue
+
+            # Get position
+            pos = [marker.pose.position.x, marker.pose.position.y, marker.pose.position.z]
+            
+            # Get dimensions (marker.scale is full size, need half size)
+            half_size = [marker.scale.x / 2.0, marker.scale.y / 2.0, marker.scale.z / 2.0]
+            
+            # Get color
+            color = [
+                int(marker.color.r * 255),
+                int(marker.color.g * 255),
+                int(marker.color.b * 255),
+                int(marker.color.a * 255)
+            ]
+            
+            # Create label from namespace or ID
+            label = marker.ns if marker.ns else f"obj_{marker.id}"
+            
+            boxes_positions.append(pos)
+            boxes_half_sizes.append(half_size)
+            boxes_colors.append(color)
+            boxes_labels.append(label)
+
+        # Log all boxes as Boxes3D
+        if len(boxes_positions) > 0:
+            boxes_positions = np.array(boxes_positions, dtype=np.float32)
+            boxes_half_sizes = np.array(boxes_half_sizes, dtype=np.float32)
+            boxes_colors = np.array(boxes_colors, dtype=np.uint8)
+
+            try:
+                rr.log(
+                    entity_path,
+                    rr.Boxes3D(
+                        centers=boxes_positions,
+                        half_sizes=boxes_half_sizes,
+                        colors=boxes_colors,
+                        labels=boxes_labels,
+                    )
+                )
+            except Exception as e:
+                self.get_logger().warn(f"Failed to log DualMap bboxes at {entity_path}: {e}")
+
+    def cb_dualmap_annotated_image_percam(self, msg: Image, base_entity: str):
+        """
+        Callback for DualMap per-camera annotated images.
+        Visualizes YOLO-World detection-annotated images from semantic mapping for each camera.
+        Images are attached to the camera entity, similar to detection images.
+        """
+        entity_path = f"{base_entity}/dualmap_detection"
+        
+        try:
+            img_rgb = color_image_from_ros(msg)
+        except Exception as e:
+            self.get_logger().warn(f"{entity_path}: DualMap annotated image convert failed: {e}")
+            return
+
+        # Resize to match depth resolution if available
+        target_res = self.camera_depth_res.get(base_entity, None)
+        if target_res is not None and self._cv2 is not None:
+            target_w, target_h = target_res
+            try:
+                img_rgb = self._cv2.resize(img_rgb, (target_w, target_h), interpolation=self._cv2.INTER_AREA)
+            except Exception as e:
+                self.get_logger().warn(f"{entity_path}: DualMap annotated image resize failed ({e}); using original.")
+
+        try:
+            rr.log(entity_path, rr.Image(img_rgb))
+        except Exception as e:
+            self.get_logger().warn(f"{entity_path}: rr.Image logging failed: {e}")
 
     def cb_supermap_annotated_image(self, msg: Image, entity_path: str):
         """
